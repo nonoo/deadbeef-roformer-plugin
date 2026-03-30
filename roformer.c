@@ -31,6 +31,7 @@ static void build_cache_key(DB_playItem_t *it, int mode, char *hex, size_t hex_s
 #define ROFORMER_MODE_VOCAL 2
 
 #define CACHE_LIMIT_BYTES (1024LL * 1024LL * 1024LL)
+#define CACHE_LIMIT_DEFAULT_MB 1024
 #define WAV_HEADER_SIZE 44
 
 typedef struct {
@@ -660,6 +661,11 @@ cache_entry_cmp(const void *a, const void *b) {
 
 static void
 cache_enforce_limit(void) {
+    int limit_mb = deadbeef->conf_get_int("roformer.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
+    if (limit_mb < 1) {
+        limit_mb = 1;
+    }
+    int64_t limit_bytes = (int64_t)limit_mb * 1024LL * 1024LL;
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
     if (!cache_dir[0]) {
@@ -709,14 +715,15 @@ cache_enforce_limit(void) {
     }
     closedir(dir);
 
-    if (total <= CACHE_LIMIT_BYTES || nentries == 0) {
+    if (total <= limit_bytes || nentries == 0) {
         free(entries);
         return;
     }
 
-    trace("roformer: cache over limit (%lld), evicting oldest entries\n", (long long)total);
+    trace("roformer: cache over limit total=%lld limit=%lld, evicting oldest entries\n",
+        (long long)total, (long long)limit_bytes);
     qsort(entries, nentries, sizeof(cache_entry_t), cache_entry_cmp);
-    for (size_t i = 0; i < nentries && total > CACHE_LIMIT_BYTES; i++) {
+    for (size_t i = 0; i < nentries && total > limit_bytes; i++) {
         if (unlink(entries[i].path) == 0) {
             cache_index_rewrite_with_filter(entries[i].path);
             total -= entries[i].size;
@@ -1795,6 +1802,7 @@ static const char *exts[] = {"wav", NULL};
 
 static const char settings_dlg[] =
     "property \"Mel-Band-Roformer-Vocal-Model directory\" file roformer.model_dir \"\";\n"
+    "property \"Cache size limit (MB)\" entry roformer.cache_limit_mb 1024;\n"
     "property \"Enable verbose logging\" checkbox roformer.trace 0;\n"
     "property \"Python executable\" entry roformer.python \"python3\";\n";
 
