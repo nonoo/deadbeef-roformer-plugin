@@ -1900,6 +1900,7 @@ notify_waveform_refresh_for_source(const char *source_uri) {
     char playing_src[PATH_MAX] = {0};
     get_track_source_uri(playing, playing_src, sizeof(playing_src));
     if (playing_src[0] && !strcmp(playing_src, source_uri)) {
+        deadbeef->pl_replace_meta(playing, ":WAVEFORM_FORCED_REGEN_TOKEN", "1");
         ddb_event_track_t *ev = (ddb_event_track_t *)deadbeef->event_alloc(DB_EV_TRACKINFOCHANGED);
         if (ev) {
             ev->track = playing;
