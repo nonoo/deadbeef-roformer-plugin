@@ -1,6 +1,6 @@
 # Source Separation DeaDBeeF Plugin
 
-`sourcesep.so` is an out-of-tree DeaDBeeF decoder plugin that plays source-separated output from the Vocal Separation Script project.
+`sourcesep.so` is an out-of-tree DeaDBeeF decoder plugin that plays source-separated output.
 
 It can switch playback between:
 - original source (`🔊`)
