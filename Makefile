@@ -1,0 +1,25 @@
+CC ?= cc
+CFLAGS ?= -O2 -fPIC -std=c99 -Wall -Wextra
+
+DEADBEEF_DIR ?= ../deadbeef
+
+GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>/dev/null || echo "")
+INCLUDES = -I$(DEADBEEF_DIR)/include -I$(DEADBEEF_DIR)/plugins/gtkui $(GTK_CFLAGS)
+LDFLAGS_SO = -shared
+LIBS = $(shell pkg-config --libs gtk+-3.0 2>/dev/null || echo "")
+
+TARGET = roformer.so
+SRC = roformer.c
+INSTALL_DIR = $(HOME)/.local/lib/deadbeef
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS_SO) -o $@ $^ $(LIBS)
+
+clean:
+	rm -f $(TARGET)
+
+install: $(TARGET)
+	mkdir -p "$(INSTALL_DIR)"
+	cp -f "$(TARGET)" "$(INSTALL_DIR)/$(TARGET)"
