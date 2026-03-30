@@ -1190,6 +1190,19 @@ restart_if_playing(void) {
     }
     ddb_playback_state_t st = output->state();
     if (st == DDB_PLAYBACK_STATE_PLAYING || st == DDB_PLAYBACK_STATE_PAUSED) {
+        DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
+        if (it) {
+            deadbeef->pl_lock();
+            const char *uri = deadbeef->pl_find_meta(it, ":URI");
+            if (uri) {
+                strncpy(restart_uri, uri, sizeof(restart_uri) - 1);
+                restart_uri[sizeof(restart_uri) - 1] = 0;
+                restart_pos = deadbeef->streamer_get_playpos();
+                trace("sourcesep: captured restart position %.2f for %s\n", restart_pos, restart_uri);
+            }
+            deadbeef->pl_unlock();
+            deadbeef->pl_item_unref(it);
+        }
         deadbeef->sendmessage(DB_EV_PLAY_CURRENT, 0, 0, 0);
     }
 }
@@ -1916,29 +1929,40 @@ drain_pipe_to_cache(sourcesep_info_t *ri, int64_t min_total_bytes) {
 
 static int
 cache_file_plausible(sourcesep_info_t *ri, const char *cache_path) {
+    float dur = deadbeef->pl_get_item_duration(ri->track);
+    if (dur <= 0.0f) {
+        return 1;
+    }
+
+    if (ri->cache_snd) {
+        int64_t expected_frames = (int64_t)(dur * (float)ri->samplerate);
+        int ok = ri->cache_sfinfo.frames >= (expected_frames / 4);
+        if (!ok) {
+            trace("sourcesep: cache not plausible (snd): frames=%lld expected=%lld dur=%.2f\n",
+                (long long)ri->cache_sfinfo.frames, (long long)expected_frames, dur);
+        }
+        return ok;
+    }
+
     struct stat st = {0};
     if (stat(cache_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         return 0;
     }
-    if (st.st_size < ri->bytes_per_frame) {
-        return 0;
+
+    int64_t expected_bytes = (int64_t)(dur * (float)ri->samplerate * (float)ri->bytes_per_frame * 0.25f);
+    if (path_has_mp3_ext(cache_path)) {
+        expected_bytes /= 20; // Account for MP3 compression
     }
-    deadbeef->pl_lock();
-    DB_playItem_t *curr = deadbeef->streamer_get_playing_track_safe();
-    float dur = 0;
-    if (curr) {
-        dur = deadbeef->pl_get_item_duration(curr);
-        deadbeef->pl_item_unref(curr);
+
+    if (expected_bytes < (int64_t)ri->bytes_per_frame) {
+        expected_bytes = ri->bytes_per_frame;
     }
-    deadbeef->pl_unlock();
-    if (dur <= 0.0f) {
-        return 1;
+    int ok = st.st_size >= expected_bytes;
+    if (!ok) {
+        trace("sourcesep: cache not plausible: size=%lld expected=%lld dur=%.2f\n",
+            (long long)st.st_size, (long long)expected_bytes, dur);
     }
-    int64_t expected = (int64_t)(dur * (float)ri->samplerate * (float)ri->bytes_per_frame * 0.25f);
-    if (expected < ri->bytes_per_frame) {
-        expected = ri->bytes_per_frame;
-    }
-    return st.st_size >= expected;
+    return ok;
 }
 
 static void
@@ -2517,6 +2541,7 @@ sourcesep_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
                 }
                 deadbeef->pl_unlock();
                 if (match) {
+                    trace("sourcesep: performing seek to %.2f\n", restart_pos);
                     deadbeef->sendmessage(DB_EV_SEEK, 0, (uint32_t)(restart_pos * 1000), 0);
                 }
                 deadbeef->pl_item_unref(playing);
