@@ -24,7 +24,7 @@ extern char **environ;
 
 static DB_functions_t *deadbeef;
 static DB_decoder_t plugin;
-static int roformer_seek_sample(DB_fileinfo_t *_info, int sample);
+static int sourcesep_seek_sample(DB_fileinfo_t *_info, int sample);
 static int get_samplerate(DB_playItem_t *it);
 static int get_channels(DB_playItem_t *it);
 static void notify_waveform_refresh_for_source(const char *source_uri);
@@ -33,9 +33,9 @@ static int resolve_cache_final_path(DB_playItem_t *it, int mode, char *out, size
 static void cache_index_rewrite_with_filter(const char *remove_cache_path);
 static int convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, int channels);
 
-#define ROFORMER_MODE_ORIGINAL 0
-#define ROFORMER_MODE_INSTRUMENTAL 1
-#define ROFORMER_MODE_VOCAL 2
+#define SOURCESEP_MODE_ORIGINAL 0
+#define SOURCESEP_MODE_INSTRUMENTAL 1
+#define SOURCESEP_MODE_VOCAL 2
 
 #define CACHE_LIMIT_BYTES (1024LL * 1024LL * 1024LL)
 #define CACHE_LIMIT_DEFAULT_MB 1024
@@ -68,9 +68,9 @@ typedef struct {
     char source_uri[PATH_MAX];
     int64_t source_mtime;
     int64_t source_size;
-} roformer_info_t;
+} sourcesep_info_t;
 
-static void finish_stream(roformer_info_t *ri, int aborted);
+static void finish_stream(sourcesep_info_t *ri, int aborted);
 
 typedef struct {
     char path[PATH_MAX];
@@ -97,7 +97,7 @@ static volatile int precache_rescan;
 static DB_plugin_action_t mode_action;
 
 #define trace(...) do { \
-    if (deadbeef->conf_get_int("roformer.trace", 0)) { \
+    if (deadbeef->conf_get_int("sourcesep.trace", 0)) { \
         deadbeef->log_detailed(&plugin.plugin, 0, __VA_ARGS__); \
     } \
 } while (0)
@@ -105,9 +105,9 @@ static DB_plugin_action_t mode_action;
 static const char *
 mode_emoji(int mode) {
     switch (mode) {
-    case ROFORMER_MODE_INSTRUMENTAL:
+    case SOURCESEP_MODE_INSTRUMENTAL:
         return "🎸";
-    case ROFORMER_MODE_VOCAL:
+    case SOURCESEP_MODE_VOCAL:
         return "🎤";
     default:
         return "🔊";
@@ -115,19 +115,19 @@ mode_emoji(int mode) {
 }
 
 static int
-roformer_get_mode(void) {
-    int mode = deadbeef->conf_get_int("roformer.mode", ROFORMER_MODE_ORIGINAL);
-    if (mode < ROFORMER_MODE_ORIGINAL || mode > ROFORMER_MODE_VOCAL) {
-        mode = ROFORMER_MODE_ORIGINAL;
+sourcesep_get_mode(void) {
+    int mode = deadbeef->conf_get_int("sourcesep.mode", SOURCESEP_MODE_ORIGINAL);
+    if (mode < SOURCESEP_MODE_ORIGINAL || mode > SOURCESEP_MODE_VOCAL) {
+        mode = SOURCESEP_MODE_ORIGINAL;
     }
     return mode;
 }
 
 static void
-roformer_set_mode(int mode) {
-    deadbeef->conf_set_int("roformer.mode", mode);
+sourcesep_set_mode(int mode) {
+    deadbeef->conf_set_int("sourcesep.mode", mode);
     deadbeef->conf_save();
-    trace("roformer: mode set to %d\n", mode);
+    trace("sourcesep: mode set to %d\n", mode);
 }
 
 static void
@@ -144,7 +144,7 @@ get_cache_dir(char *out, size_t out_sz) {
     if (!out || out_sz == 0) {
         return;
     }
-    int n = snprintf(out, out_sz, "/tmp/deadbeef-%d-roformer-cache", (int)getuid());
+    int n = snprintf(out, out_sz, "/tmp/deadbeef-%d-sourcesep-cache", (int)getuid());
     if (n < 0 || (size_t)n >= out_sz) {
         out[0] = 0;
         return;
@@ -156,7 +156,7 @@ get_f32tmp_dir(char *out, size_t out_sz) {
     if (!out || out_sz == 0) {
         return;
     }
-    int n = snprintf(out, out_sz, "/tmp/deadbeef-%d-roformer-cache-f32tmp", (int)getuid());
+    int n = snprintf(out, out_sz, "/tmp/deadbeef-%d-sourcesep-cache-f32tmp", (int)getuid());
     if (n < 0 || (size_t)n >= out_sz) {
         out[0] = 0;
         return;
@@ -256,13 +256,13 @@ parse_mode_token(const char *tok) {
         return -1;
     }
     if (!strcmp(tok, "instr")) {
-        return ROFORMER_MODE_INSTRUMENTAL;
+        return SOURCESEP_MODE_INSTRUMENTAL;
     }
     if (!strcmp(tok, "vocal")) {
-        return ROFORMER_MODE_VOCAL;
+        return SOURCESEP_MODE_VOCAL;
     }
     int mode = atoi(tok); // backward compatibility with old numeric index entries
-    if (mode == ROFORMER_MODE_INSTRUMENTAL || mode == ROFORMER_MODE_VOCAL) {
+    if (mode == SOURCESEP_MODE_INSTRUMENTAL || mode == SOURCESEP_MODE_VOCAL) {
         return mode;
     }
     return -1;
@@ -270,7 +270,7 @@ parse_mode_token(const char *tok) {
 
 static const char *
 mode_to_token(int mode) {
-    return mode == ROFORMER_MODE_VOCAL ? "vocal" : "instr";
+    return mode == SOURCESEP_MODE_VOCAL ? "vocal" : "instr";
 }
 
 static int
@@ -389,7 +389,7 @@ get_track_source_uri(DB_playItem_t *it, char *uri_out, size_t uri_out_sz) {
     }
     uri_out[0] = 0;
     deadbeef->pl_lock();
-    const char *src = deadbeef->pl_find_meta(it, ":ROFORMER_SOURCE_URI");
+    const char *src = deadbeef->pl_find_meta(it, ":SOURCESEP_SOURCE_URI");
     if (!src) {
         src = deadbeef->pl_find_meta(it, ":URI");
     }
@@ -489,7 +489,7 @@ cache_remove_unrelated_files(void) {
         if (!uri_in_current_playlist(uri) && !uri_is_currently_playing_or_loaded(uri)) {
             if (unlink(full) == 0) {
                 cache_index_rewrite_with_filter(full);
-                trace("roformer: removed unrelated cache %s uri=%s\n", full, uri);
+                trace("sourcesep: removed unrelated cache %s uri=%s\n", full, uri);
             }
         }
     }
@@ -542,7 +542,7 @@ uri_protected_from_precache_eviction(const char *uri) {
 static int
 precache_make_room_or_stop(void) {
     cache_remove_unrelated_files();
-    int limit_mb = deadbeef->conf_get_int("roformer.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
+    int limit_mb = deadbeef->conf_get_int("sourcesep.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
     if (limit_mb < 1) {
         limit_mb = 1;
     }
@@ -596,13 +596,13 @@ precache_make_room_or_stop(void) {
         if (cache_index_find_uri_by_cache_file(oldest.path, oldest_uri, sizeof(oldest_uri)) == 0
             && oldest_uri[0]
             && uri_protected_from_precache_eviction(oldest_uri)) {
-            trace("roformer: precache paused, oldest cache is at/after current playing entry: %s\n", oldest_uri);
+            trace("sourcesep: precache paused, oldest cache is at/after current playing entry: %s\n", oldest_uri);
             return 0;
         }
 
         if (unlink(oldest.path) == 0) {
             cache_index_rewrite_with_filter(oldest.path);
-            trace("roformer: precache evicted oldest cache %s\n", oldest.path);
+            trace("sourcesep: precache evicted oldest cache %s\n", oldest.path);
         }
         else {
             return 0;
@@ -627,7 +627,7 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *
     FILE *fp = fopen(index_path, "r");
     if (!fp) {
         if (errno != ENOENT) {
-            trace("roformer: index open failed path=%s errno=%d\n", index_path, errno);
+            trace("sourcesep: index open failed path=%s errno=%d\n", index_path, errno);
         }
         return -1;
     }
@@ -657,7 +657,7 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *
     }
     fclose(fp);
     if (found != 0) {
-        trace("roformer: index miss mode=%d mtime=%lld size=%lld uri=%s\n",
+        trace("sourcesep: index miss mode=%d mtime=%lld size=%lld uri=%s\n",
             mode, (long long)mtime, (long long)size, uri ? uri : "(null)");
     }
     return found;
@@ -746,7 +746,7 @@ cache_index_upsert(const char *uri, int mode, int64_t mtime, int64_t size, int s
     fprintf(fp, "%s\t%lld\t%lld\t%d\t%d\t%d\t%s\t%s\n",
         mode_to_token(mode), (long long)mtime, (long long)size, samplerate, channels, complete, cache_file, uri);
     fclose(fp);
-    trace("roformer: index upsert mode=%d sr=%d ch=%d complete=%d mtime=%lld size=%lld cache=%s uri=%s\n",
+    trace("sourcesep: index upsert mode=%d sr=%d ch=%d complete=%d mtime=%lld size=%lld cache=%s uri=%s\n",
         mode, samplerate, channels, complete, (long long)mtime, (long long)size, cache_file, uri);
 }
 
@@ -876,7 +876,7 @@ cache_remove_unindexed_mp3s(void) {
                 continue;
             }
             if (!path_list_contains(indexed, nindexed, full)) {
-                trace("roformer: removing orphan cache %s\n", full);
+                trace("sourcesep: removing orphan cache %s\n", full);
                 unlink(full);
             }
         }
@@ -928,7 +928,7 @@ cache_remove_stale_temp_files(void) {
             continue;
         }
         if (unlink(full) == 0) {
-            trace("roformer: removed stale temp cache %s\n", full);
+            trace("sourcesep: removed stale temp cache %s\n", full);
         }
     }
     closedir(dir);
@@ -1013,7 +1013,7 @@ cache_entry_cmp(const void *a, const void *b) {
 static void
 cache_enforce_limit(void) {
     cache_remove_unrelated_files();
-    int limit_mb = deadbeef->conf_get_int("roformer.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
+    int limit_mb = deadbeef->conf_get_int("sourcesep.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
     if (limit_mb < 1) {
         limit_mb = 1;
     }
@@ -1072,7 +1072,7 @@ cache_enforce_limit(void) {
         return;
     }
 
-    trace("roformer: cache over limit total=%lld limit=%lld, evicting oldest entries\n",
+    trace("sourcesep: cache over limit total=%lld limit=%lld, evicting oldest entries\n",
         (long long)total, (long long)limit_bytes);
     qsort(entries, nentries, sizeof(cache_entry_t), cache_entry_cmp);
     for (size_t i = 0; i < nentries && total > limit_bytes; i++) {
@@ -1089,7 +1089,7 @@ update_button_label(void) {
     if (!mode_button) {
         return;
     }
-    gtk_button_set_label(GTK_BUTTON(mode_button), mode_emoji(roformer_get_mode()));
+    gtk_button_set_label(GTK_BUTTON(mode_button), mode_emoji(sourcesep_get_mode()));
 }
 
 static void
@@ -1111,10 +1111,10 @@ apply_mode_to_track(DB_playItem_t *it, int mode) {
         return;
     }
 
-    if (mode == ROFORMER_MODE_ORIGINAL) {
+    if (mode == SOURCESEP_MODE_ORIGINAL) {
         deadbeef->pl_lock();
         const char *current_dec = deadbeef->pl_find_meta(it, ":DECODER");
-        const char *orig_dec = deadbeef->pl_find_meta(it, ":ROFORMER_ORIG_DECODER");
+        const char *orig_dec = deadbeef->pl_find_meta(it, ":SOURCESEP_ORIG_DECODER");
         char orig_copy[128] = {0};
         char current_copy[128] = {0};
         if (orig_dec) {
@@ -1128,15 +1128,15 @@ apply_mode_to_track(DB_playItem_t *it, int mode) {
         if (current_copy[0] && !strcmp(current_copy, plugin.plugin.id) && orig_copy[0]) {
             deadbeef->pl_replace_meta(it, ":DECODER", orig_copy);
         }
-        deadbeef->pl_delete_meta(it, ":ROFORMER_ORIG_DECODER");
-        deadbeef->pl_delete_meta(it, ":ROFORMER_SOURCE_URI");
+        deadbeef->pl_delete_meta(it, ":SOURCESEP_ORIG_DECODER");
+        deadbeef->pl_delete_meta(it, ":SOURCESEP_SOURCE_URI");
         return;
     }
 
     if (decoder_copy[0] && strcmp(decoder_copy, plugin.plugin.id)) {
-        deadbeef->pl_replace_meta(it, ":ROFORMER_ORIG_DECODER", decoder_copy);
+        deadbeef->pl_replace_meta(it, ":SOURCESEP_ORIG_DECODER", decoder_copy);
     }
-    deadbeef->pl_replace_meta(it, ":ROFORMER_SOURCE_URI", uri_copy);
+    deadbeef->pl_replace_meta(it, ":SOURCESEP_SOURCE_URI", uri_copy);
     deadbeef->pl_replace_meta(it, ":DECODER", plugin.plugin.id);
 }
 
@@ -1178,8 +1178,8 @@ restart_if_playing(void) {
 
 static void
 ensure_playing_track_mode(void) {
-    int mode = roformer_get_mode();
-    if (mode == ROFORMER_MODE_ORIGINAL) {
+    int mode = sourcesep_get_mode();
+    if (mode == SOURCESEP_MODE_ORIGINAL) {
         return;
     }
     DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
@@ -1202,7 +1202,7 @@ ensure_playing_track_mode(void) {
 
 static void
 precache_single_track(DB_playItem_t *it, int mode) {
-    if (!it || mode == ROFORMER_MODE_ORIGINAL) {
+    if (!it || mode == SOURCESEP_MODE_ORIGINAL) {
         return;
     }
     if (!precache_make_room_or_stop()) {
@@ -1247,7 +1247,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
     }
 
     char script[PATH_MAX];
-    const char *script_key = mode == ROFORMER_MODE_VOCAL ? "roformer.vocal_separation_script" : "roformer.instrumental_separation_script";
+    const char *script_key = mode == SOURCESEP_MODE_VOCAL ? "sourcesep.vocal_separation_script" : "sourcesep.instrumental_separation_script";
     deadbeef->conf_get_str(script_key, "", script, sizeof(script));
     if (!script[0]) {
         return;
@@ -1255,14 +1255,14 @@ precache_single_track(DB_playItem_t *it, int mode) {
 
     int sr = get_samplerate(it);
     int ch = get_channels(it);
-    const char *stream_arg = mode == ROFORMER_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
+    const char *stream_arg = mode == SOURCESEP_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         return;
     }
 
-    trace("roformer: precache spawn inference: \"%s\" --input \"%s\" %s\n", script, uri_copy, stream_arg);
+    trace("sourcesep: precache spawn inference: \"%s\" --input \"%s\" %s\n", script, uri_copy, stream_arg);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -1294,7 +1294,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
     out_sfinfo.channels = ch;
     SNDFILE *out = sf_open(final_path, SFM_WRITE, &out_sfinfo);
     if (!out) {
-        trace("roformer: failed to open mp3 for precache: %s, error: %s\n", final_path, sf_strerror(NULL));
+        trace("sourcesep: failed to open mp3 for precache: %s, error: %s\n", final_path, sf_strerror(NULL));
         close(pipefd[0]);
         kill(pid, SIGTERM);
         waitpid(pid, NULL, 0);
@@ -1311,7 +1311,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
     size_t frame_sz = ch * 4;
     while ((got = read(pipefd[0], buf, sizeof(buf))) > 0) {
         if (uri_is_currently_playing_or_loaded(uri_copy)) {
-            trace("roformer: precache stopped, track started playing: %s\n", uri_copy);
+            trace("sourcesep: precache stopped, track started playing: %s\n", uri_copy);
             close(pipefd[0]);
             kill(pid, SIGTERM);
             waitpid(pid, NULL, 0);
@@ -1330,7 +1330,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
     int status = 0;
     waitpid(pid, &status, 0);
     if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
-        trace("roformer: precache inference failed status=%d\n", WEXITSTATUS(status));
+        trace("sourcesep: precache inference failed status=%d\n", WEXITSTATUS(status));
         unlink(final_path);
         return;
     }
@@ -1350,8 +1350,8 @@ precache_worker(void *ctx) {
     (void)ctx;
     while (1) {
         precache_rescan = 0;
-        int mode = roformer_get_mode();
-        if (mode == ROFORMER_MODE_ORIGINAL) {
+        int mode = sourcesep_get_mode();
+        if (mode == SOURCESEP_MODE_ORIGINAL) {
             break;
         }
         deadbeef->pl_lock();
@@ -1408,7 +1408,7 @@ precache_worker(void *ctx) {
             deadbeef->pl_unlock();
             deadbeef->pl_item_unref(it);
             it = next;
-            if (precache_rescan || roformer_get_mode() == ROFORMER_MODE_ORIGINAL) {
+            if (precache_rescan || sourcesep_get_mode() == SOURCESEP_MODE_ORIGINAL) {
                 while (it) {
                     deadbeef->pl_lock();
                     DB_playItem_t *next2 = deadbeef->pl_get_next(it, PL_MAIN);
@@ -1430,7 +1430,7 @@ precache_worker(void *ctx) {
 static void
 schedule_precache_rescan(void) {
     precache_rescan = 1;
-    if (precache_running || roformer_get_mode() == ROFORMER_MODE_ORIGINAL) {
+    if (precache_running || sourcesep_get_mode() == SOURCESEP_MODE_ORIGINAL) {
         return;
     }
     precache_running = 1;
@@ -1445,9 +1445,9 @@ schedule_precache_rescan(void) {
 
 static int
 cycle_mode(void) {
-    int mode = roformer_get_mode();
+    int mode = sourcesep_get_mode();
     mode = (mode + 1) % 3;
-    roformer_set_mode(mode);
+    sourcesep_set_mode(mode);
     update_button_label();
     apply_mode_to_current_playlist(mode);
     restart_if_playing();
@@ -1464,7 +1464,7 @@ mode_action_cb(DB_plugin_action_t *act, ddb_action_context_t ctx) {
 }
 
 static DB_plugin_action_t *
-roformer_get_actions(DB_playItem_t *it) {
+sourcesep_get_actions(DB_playItem_t *it) {
     (void)it;
     return &mode_action;
 }
@@ -1500,7 +1500,7 @@ on_mode_button_clicked(GtkButton *button, gpointer user_data) {
 }
 
 static void
-roformer_window_init(void *userdata) {
+sourcesep_window_init(void *userdata) {
     (void)userdata;
     if (!gtkui_api || mode_button) {
         return;
@@ -1520,7 +1520,7 @@ roformer_window_init(void *userdata) {
         return;
     }
 
-    mode_button = gtk_button_new_with_label(mode_emoji(roformer_get_mode()));
+    mode_button = gtk_button_new_with_label(mode_emoji(sourcesep_get_mode()));
     gtk_widget_set_can_focus(mode_button, FALSE);
     gtk_button_set_relief(GTK_BUTTON(mode_button), GTK_RELIEF_NONE);
     gtk_box_pack_end(GTK_BOX(msg_area), mode_button, FALSE, FALSE, 4);
@@ -1538,7 +1538,7 @@ try_install_gui_button(void) {
     }
     gtkui_api = (ddb_gtkui_t *)g;
     if (gtkui_api->add_window_init_hook) {
-        gtkui_api->add_window_init_hook(roformer_window_init, NULL);
+        gtkui_api->add_window_init_hook(sourcesep_window_init, NULL);
     }
 }
 
@@ -1596,7 +1596,7 @@ build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_ou
     }
 
     deadbeef->pl_lock();
-    const char *uri = deadbeef->pl_find_meta(it, ":ROFORMER_SOURCE_URI");
+    const char *uri = deadbeef->pl_find_meta(it, ":SOURCESEP_SOURCE_URI");
     if (!uri) {
         uri = deadbeef->pl_find_meta(it, ":URI");
     }
@@ -1630,7 +1630,7 @@ build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_ou
         strncpy(safe_stem, "track", sizeof(safe_stem) - 1);
     }
 
-    const char *suffix = mode == ROFORMER_MODE_VOCAL ? ".vocal.mp3" : ".instr.mp3";
+    const char *suffix = mode == SOURCESEP_MODE_VOCAL ? ".vocal.mp3" : ".instr.mp3";
     snprintf(name_out, name_out_sz, "%s%s", safe_stem, suffix);
 }
 
@@ -1665,7 +1665,7 @@ convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, i
     in_sfinfo.channels = channels;
     SNDFILE *in = sf_open(raw_path, SFM_READ, &in_sfinfo);
     if (!in) {
-        trace("roformer: failed to open raw for conversion: %s, error: %s\n", raw_path, sf_strerror(NULL));
+        trace("sourcesep: failed to open raw for conversion: %s, error: %s\n", raw_path, sf_strerror(NULL));
         return -1;
     }
 
@@ -1675,7 +1675,7 @@ convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, i
     out_sfinfo.channels = channels;
     SNDFILE *out = sf_open(mp3_path, SFM_WRITE, &out_sfinfo);
     if (!out) {
-        trace("roformer: failed to open mp3 for conversion: %s, error: %s\n", mp3_path, sf_strerror(NULL));
+        trace("sourcesep: failed to open mp3 for conversion: %s, error: %s\n", mp3_path, sf_strerror(NULL));
         sf_close(in);
         return -1;
     }
@@ -1697,7 +1697,7 @@ convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, i
 }
 
 static int
-spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
+spawn_inference(sourcesep_info_t *ri, const char *src_uri, int mode) {
     if (!src_uri || !src_uri[0]) {
         return -1;
     }
@@ -1708,14 +1708,14 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
     }
 
     char script[PATH_MAX];
-    const char *script_key = mode == ROFORMER_MODE_VOCAL ? "roformer.vocal_separation_script" : "roformer.instrumental_separation_script";
+    const char *script_key = mode == SOURCESEP_MODE_VOCAL ? "sourcesep.vocal_separation_script" : "sourcesep.instrumental_separation_script";
     deadbeef->conf_get_str(script_key, "", script, sizeof(script));
     if (!script[0]) {
         return -1;
     }
 
-    const char *stream_arg = mode == ROFORMER_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
-    trace("roformer: spawn inference cmd: \"%s\" --input \"%s\" %s\n",
+    const char *stream_arg = mode == SOURCESEP_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
+    trace("sourcesep: spawn inference cmd: \"%s\" --input \"%s\" %s\n",
         script, path, stream_arg);
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
@@ -1763,7 +1763,7 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
     if (flags >= 0) {
         fcntl(ri->pipe_fd, F_SETFL, flags | O_NONBLOCK);
     }
-    trace("roformer: spawn success pid=%d pipe_fd=%d\n", (int)pid, ri->pipe_fd);
+    trace("sourcesep: spawn success pid=%d pipe_fd=%d\n", (int)pid, ri->pipe_fd);
 
     const char *base = strrchr(ri->cache_final_path, '/');
     base = base ? base + 1 : ri->cache_final_path;
@@ -1783,18 +1783,18 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
     }
     ri->cache_fp_write = fopen(ri->cache_raw_path, "wb");
     if (!ri->cache_fp_write) {
-        trace("roformer: cache open failed path=%s errno=%d\n", ri->cache_raw_path, errno);
+        trace("sourcesep: cache open failed path=%s errno=%d\n", ri->cache_raw_path, errno);
         return 0;
     }
     ri->owns_temp_cache = 1;
-    trace("roformer: cache write opened path=%s\n", ri->cache_raw_path);
+    trace("sourcesep: cache write opened path=%s\n", ri->cache_raw_path);
     ri->cache_bytes_written = 0;
     ri->cache_data_offset = 0;
     ri->cache_frames_written = 0;
     if (!ri->cache_fp) {
         ri->cache_fp = fopen(ri->cache_raw_path, "rb");
         if (!ri->cache_fp) {
-            trace("roformer: cache read open failed path=%s errno=%d\n", ri->cache_raw_path, errno);
+            trace("sourcesep: cache read open failed path=%s errno=%d\n", ri->cache_raw_path, errno);
         }
         else {
             ri->using_cache = 1;
@@ -1805,7 +1805,7 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
 }
 
 static int
-open_cache_if_available(roformer_info_t *ri, const char *cache_path) {
+open_cache_if_available(sourcesep_info_t *ri, const char *cache_path) {
     struct stat st = {0};
     if (stat(cache_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         return -1;
@@ -1832,12 +1832,12 @@ open_cache_if_available(roformer_info_t *ri, const char *cache_path) {
     ri->cache_frames_written = sfinfo.frames;
     ri->stream_finished = 1;
     ri->cache_valid = 1;
-    trace("roformer: cache hit %s\n", cache_path);
+    trace("sourcesep: cache hit %s\n", cache_path);
     return 0;
 }
 
 static void
-drain_pipe_to_cache(roformer_info_t *ri, int64_t min_total_bytes) {
+drain_pipe_to_cache(sourcesep_info_t *ri, int64_t min_total_bytes) {
     if (ri->pipe_fd < 0 || !ri->cache_fp_write || ri->stream_finished) {
         return;
     }
@@ -1880,7 +1880,7 @@ drain_pipe_to_cache(roformer_info_t *ri, int64_t min_total_bytes) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             break;
         }
-        trace("roformer: read pipe error errno=%d\n", errno);
+        trace("sourcesep: read pipe error errno=%d\n", errno);
         finish_stream(ri, 0);
         break;
     }
@@ -1888,7 +1888,7 @@ drain_pipe_to_cache(roformer_info_t *ri, int64_t min_total_bytes) {
 }
 
 static int
-cache_file_plausible(roformer_info_t *ri, const char *cache_path) {
+cache_file_plausible(sourcesep_info_t *ri, const char *cache_path) {
     struct stat st = {0};
     if (stat(cache_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         return 0;
@@ -1938,9 +1938,9 @@ notify_waveform_refresh_for_source(const char *source_uri) {
 }
 
 static DB_fileinfo_t *
-roformer_open(uint32_t hints) {
+sourcesep_open(uint32_t hints) {
     (void)hints;
-    roformer_info_t *ri = calloc(1, sizeof(roformer_info_t));
+    sourcesep_info_t *ri = calloc(1, sizeof(sourcesep_info_t));
     if (!ri) {
         return NULL;
     }
@@ -1949,12 +1949,12 @@ roformer_open(uint32_t hints) {
 }
 
 static int
-roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
-    roformer_info_t *ri = (roformer_info_t *)_info;
+sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
+    sourcesep_info_t *ri = (sourcesep_info_t *)_info;
     ri->track = it;
     deadbeef->pl_item_ref(it);
-    ri->mode = roformer_get_mode();
-    if (ri->mode == ROFORMER_MODE_ORIGINAL) {
+    ri->mode = sourcesep_get_mode();
+    if (ri->mode == SOURCESEP_MODE_ORIGINAL) {
         return -1;
     }
 
@@ -1966,7 +1966,7 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     ensure_dir(cache_dir);
 
     deadbeef->pl_lock();
-    const char *src = deadbeef->pl_find_meta(it, ":ROFORMER_SOURCE_URI");
+    const char *src = deadbeef->pl_find_meta(it, ":SOURCESEP_SOURCE_URI");
     if (!src) {
         src = deadbeef->pl_find_meta(it, ":URI");
     }
@@ -1975,11 +1975,11 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     }
     deadbeef->pl_unlock();
     if (!ri->source_uri[0]) {
-        trace("roformer: init failed no source uri\n");
+        trace("sourcesep: init failed no source uri\n");
         return -1;
     }
     get_uri_file_stat(ri->source_uri, &ri->source_mtime, &ri->source_size);
-    trace("roformer: init mode=%d uri=%s mtime=%lld size=%lld\n",
+    trace("sourcesep: init mode=%d uri=%s mtime=%lld size=%lld\n",
         ri->mode, ri->source_uri, (long long)ri->source_mtime, (long long)ri->source_size);
 
     if (cache_index_lookup(
@@ -1991,7 +1991,7 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
             &ri->channels,
             ri->cache_final_path,
             sizeof(ri->cache_final_path)) == 0) {
-        trace("roformer: index hit %s\n", ri->cache_final_path);
+        trace("sourcesep: index hit %s\n", ri->cache_final_path);
     }
     else {
         ri->samplerate = get_samplerate(it);
@@ -2001,7 +2001,7 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
         }
     }
     ri->bytes_per_frame = ri->channels * 4;
-    trace("roformer: init format sr=%d ch=%d bpf=%d cache_final=%s\n",
+    trace("sourcesep: init format sr=%d ch=%d bpf=%d cache_final=%s\n",
         ri->samplerate, ri->channels, ri->bytes_per_frame, ri->cache_final_path);
 
     if (open_cache_if_available(ri, ri->cache_final_path) != 0 || !cache_file_plausible(ri, ri->cache_final_path)) {
@@ -2020,7 +2020,7 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
                 if (stat(existing_raw, &rst) == 0 && S_ISREG(rst.st_mode)) {
                     ri->cache_bytes_written = rst.st_size;
                 }
-                trace("roformer: reusing active temp cache %s for %s\n", existing_raw, ri->cache_final_path);
+                trace("sourcesep: reusing active temp cache %s for %s\n", existing_raw, ri->cache_final_path);
                 _info->plugin = &plugin;
                 _info->fmt.channels = ri->channels;
                 _info->fmt.bps = 32;
@@ -2041,12 +2041,12 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
             sf_close(ri->cache_snd);
             ri->cache_snd = NULL;
         }
-        trace("roformer: cache miss %s\n", ri->cache_final_path);
+        trace("sourcesep: cache miss %s\n", ri->cache_final_path);
         if (!access(ri->cache_final_path, F_OK)) {
-            trace("roformer: preserving existing partial cache %s\n", ri->cache_final_path);
+            trace("sourcesep: preserving existing partial cache %s\n", ri->cache_final_path);
         }
         ri->need_spawn = 1;
-        trace("roformer: defer spawn need_spawn=1\n");
+        trace("sourcesep: defer spawn need_spawn=1\n");
     }
 
     _info->plugin = &plugin;
@@ -2061,7 +2061,7 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
 }
 
 static void
-finish_stream(roformer_info_t *ri, int aborted) {
+finish_stream(sourcesep_info_t *ri, int aborted) {
     if (ri->stream_finished) {
         return;
     }
@@ -2077,7 +2077,7 @@ finish_stream(roformer_info_t *ri, int aborted) {
         int status = 0;
         waitpid(ri->child_pid, &status, 0);
         child_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        trace("roformer: child exit pid=%d status=%d exited=%d code=%d signaled=%d sig=%d\n",
+        trace("sourcesep: child exit pid=%d status=%d exited=%d code=%d signaled=%d sig=%d\n",
             (int)ri->child_pid,
             status,
             WIFEXITED(status),
@@ -2103,7 +2103,7 @@ finish_stream(roformer_info_t *ri, int aborted) {
         if (convert_ok) {
             convert_ok = convert_raw_to_mp3(ri->cache_raw_path, mp3_tmp_path, ri->samplerate, ri->channels) == 0;
             if (!convert_ok) {
-                trace("roformer: failed to convert raw to mp3 %s -> %s\n", ri->cache_raw_path, mp3_tmp_path);
+                trace("sourcesep: failed to convert raw to mp3 %s -> %s\n", ri->cache_raw_path, mp3_tmp_path);
             }
         }
 
@@ -2118,10 +2118,10 @@ finish_stream(roformer_info_t *ri, int aborted) {
             }
             else {
                 if (!enough_data) {
-                    trace("roformer: mp3 temp too small for finalize %s\n", mp3_tmp_path);
+                    trace("sourcesep: mp3 temp too small for finalize %s\n", mp3_tmp_path);
                 }
                 else {
-                    trace("roformer: failed to rename %s -> %s errno=%d\n", mp3_tmp_path, ri->cache_final_path, errno);
+                    trace("sourcesep: failed to rename %s -> %s errno=%d\n", mp3_tmp_path, ri->cache_final_path, errno);
                 }
                 unlink(mp3_tmp_path);
                 convert_ok = 0;
@@ -2136,7 +2136,7 @@ finish_stream(roformer_info_t *ri, int aborted) {
 
         if (!keep_raw_for_playback) {
             if (ri->owns_temp_cache && ri->cache_raw_path[0] && unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
-                trace("roformer: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
+                trace("sourcesep: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
             }
             ri->owns_temp_cache = 0;
             ri->cache_raw_path[0] = 0;
@@ -2171,7 +2171,7 @@ finish_stream(roformer_info_t *ri, int aborted) {
                 ri->cache_fp = NULL;
             }
             if (ri->owns_temp_cache && ri->cache_raw_path[0] && unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
-                trace("roformer: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
+                trace("sourcesep: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
             }
             ri->owns_temp_cache = 0;
             ri->cache_raw_path[0] = 0;
@@ -2186,16 +2186,16 @@ finish_stream(roformer_info_t *ri, int aborted) {
                 ri->channels,
                 1,
                 ri->cache_final_path);
-            trace("roformer: cache finalized %s\n", ri->cache_final_path);
+            trace("sourcesep: cache finalized %s\n", ri->cache_final_path);
         }
         if (!aborted && child_ok) {
             notify_waveform_refresh_for_source(ri->source_uri);
         }
         if (!finalized) {
             if (mp3_tmp_path[0] && unlink(mp3_tmp_path) != 0 && errno != ENOENT) {
-                trace("roformer: failed to remove mp3 temp %s errno=%d\n", mp3_tmp_path, errno);
+                trace("sourcesep: failed to remove mp3 temp %s errno=%d\n", mp3_tmp_path, errno);
             }
-            trace("roformer: cache stop aborted=%d child_ok=%d convert_ok=%d keep_raw=%d cache=%s\n",
+            trace("sourcesep: cache stop aborted=%d child_ok=%d convert_ok=%d keep_raw=%d cache=%s\n",
                 aborted, child_ok, convert_ok, keep_raw_for_playback, ri->cache_final_path);
         }
     }
@@ -2203,13 +2203,13 @@ finish_stream(roformer_info_t *ri, int aborted) {
 }
 
 static void
-roformer_free(DB_fileinfo_t *_info) {
-    roformer_info_t *ri = (roformer_info_t *)_info;
+sourcesep_free(DB_fileinfo_t *_info) {
+    sourcesep_info_t *ri = (sourcesep_info_t *)_info;
     if (!ri) {
         return;
     }
 
-    trace("roformer: free need_spawn=%d using_cache=%d stream_finished=%d data_bytes=%lld child_pid=%d\n",
+    trace("sourcesep: free need_spawn=%d using_cache=%d stream_finished=%d data_bytes=%lld child_pid=%d\n",
         ri->need_spawn, ri->using_cache, ri->stream_finished, (long long)ri->data_bytes_read, (int)ri->child_pid);
     if (ri->cache_fp) {
         fclose(ri->cache_fp);
@@ -2226,7 +2226,7 @@ roformer_free(DB_fileinfo_t *_info) {
     finish_stream(ri, 1);
     if (ri->owns_temp_cache && ri->cache_raw_path[0]) {
         if (unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
-            trace("roformer: failed to remove temp cache on free %s errno=%d\n", ri->cache_raw_path, errno);
+            trace("sourcesep: failed to remove temp cache on free %s errno=%d\n", ri->cache_raw_path, errno);
         }
     }
     ri->owns_temp_cache = 0;
@@ -2239,8 +2239,8 @@ roformer_free(DB_fileinfo_t *_info) {
 }
 
 static int
-roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
-    roformer_info_t *ri = (roformer_info_t *)_info;
+sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
+    sourcesep_info_t *ri = (sourcesep_info_t *)_info;
     if (nbytes <= 0) {
         return 0;
     }
@@ -2266,7 +2266,7 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
                         if (stat(existing_raw, &rst) == 0 && S_ISREG(rst.st_mode)) {
                             ri->cache_bytes_written = rst.st_size;
                         }
-                        trace("roformer: using existing active temp cache %s\n", existing_raw);
+                        trace("sourcesep: using existing active temp cache %s\n", existing_raw);
                     }
                 }
             }
@@ -2279,7 +2279,7 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
             char playing_src_copy[PATH_MAX] = {0};
             if ((st == DDB_PLAYBACK_STATE_PLAYING || st == DDB_PLAYBACK_STATE_PAUSED) && playing) {
                 deadbeef->pl_lock();
-                const char *playing_src = deadbeef->pl_find_meta(playing, ":ROFORMER_SOURCE_URI");
+                const char *playing_src = deadbeef->pl_find_meta(playing, ":SOURCESEP_SOURCE_URI");
                 if (!playing_src) {
                     playing_src = deadbeef->pl_find_meta(playing, ":URI");
                 }
@@ -2295,16 +2295,16 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
                 deadbeef->pl_item_unref(playing);
             }
             if (!is_active_playback) {
-                trace("roformer: suppress spawn st=%d active=%d src=%s playing_src=%s\n",
+                trace("sourcesep: suppress spawn st=%d active=%d src=%s playing_src=%s\n",
                     st, is_active_playback, ri->source_uri, playing_src_copy[0] ? playing_src_copy : "(none)");
                 return 0;
             }
             if (spawn_inference(ri, ri->source_uri, ri->mode) != 0) {
-                trace("roformer: failed to spawn inference\n");
+                trace("sourcesep: failed to spawn inference\n");
                 return 0;
             }
             ri->need_spawn = 0;
-            trace("roformer: spawn consumed need_spawn=0\n");
+            trace("sourcesep: spawn consumed need_spawn=0\n");
     }
 
     if (ri->pipe_fd >= 0) {
@@ -2383,18 +2383,18 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
 }
 
 static int
-roformer_seek(DB_fileinfo_t *_info, float time) {
-    roformer_info_t *ri = (roformer_info_t *)_info;
+sourcesep_seek(DB_fileinfo_t *_info, float time) {
+    sourcesep_info_t *ri = (sourcesep_info_t *)_info;
     if (time < 0) {
         time = 0;
     }
     int64_t frame = (int64_t)(time * ri->samplerate);
-    return roformer_seek_sample(_info, (int)frame);
+    return sourcesep_seek_sample(_info, (int)frame);
 }
 
 static int
-roformer_seek_sample(DB_fileinfo_t *_info, int sample) {
-    roformer_info_t *ri = (roformer_info_t *)_info;
+sourcesep_seek_sample(DB_fileinfo_t *_info, int sample) {
+    sourcesep_info_t *ri = (sourcesep_info_t *)_info;
     if (sample < 0) {
         sample = 0;
     }
@@ -2429,20 +2429,20 @@ roformer_seek_sample(DB_fileinfo_t *_info, int sample) {
 }
 
 DB_plugin_t *
-roformer_load(DB_functions_t *api) {
+sourcesep_load(DB_functions_t *api) {
     deadbeef = api;
     return DB_PLUGIN(&plugin);
 }
 
 static int
-roformer_start(void) {
+sourcesep_start(void) {
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
     if (cache_dir[0]) {
         ensure_dir(cache_dir);
     }
-    roformer_set_mode(ROFORMER_MODE_ORIGINAL);
-    if (deadbeef->conf_get_int("roformer.trace", 0)) {
+    sourcesep_set_mode(SOURCESEP_MODE_ORIGINAL);
+    if (deadbeef->conf_get_int("sourcesep.trace", 0)) {
         plugin.plugin.flags |= DDB_PLUGIN_FLAG_LOGGING;
     }
     else {
@@ -2454,8 +2454,8 @@ roformer_start(void) {
     cache_remove_stale_temp_files();
     try_install_gui_button();
     update_button_label();
-    int mode = roformer_get_mode();
-    if (mode != ROFORMER_MODE_ORIGINAL) {
+    int mode = sourcesep_get_mode();
+    if (mode != SOURCESEP_MODE_ORIGINAL) {
         apply_mode_to_current_playlist(mode);
     }
     schedule_precache_rescan();
@@ -2463,12 +2463,12 @@ roformer_start(void) {
 }
 
 static int
-roformer_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
+sourcesep_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
     (void)ctx;
     (void)p1;
     (void)p2;
     if (id == DB_EV_PLUGINSLOADED || id == DB_EV_CONFIGCHANGED) {
-        if (deadbeef->conf_get_int("roformer.trace", 0)) {
+        if (deadbeef->conf_get_int("sourcesep.trace", 0)) {
             plugin.plugin.flags |= DDB_PLUGIN_FLAG_LOGGING;
         }
         else {
@@ -2489,7 +2489,7 @@ roformer_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
 }
 
 static int
-roformer_stop(void) {
+sourcesep_stop(void) {
     cache_remove_dir_all();
     mode_button = NULL;
     gtkui_api = NULL;
@@ -2499,15 +2499,15 @@ roformer_stop(void) {
 static const char *exts[] = {"wav", "flac", "mp3", NULL};
 
 static const char settings_dlg[] =
-    "property \"Vocal Separation Script\" file roformer.vocal_separation_script \"\";\n"
-    "property \"Instrumental Separation Script\" file roformer.instrumental_separation_script \"\";\n"
-    "property \"Cache size limit (MB)\" entry roformer.cache_limit_mb 1024;\n"
-    "property \"Enable verbose logging\" checkbox roformer.trace 0;\n";
+    "property \"Vocal Separation Script\" file sourcesep.vocal_separation_script \"\";\n"
+    "property \"Instrumental Separation Script\" file sourcesep.instrumental_separation_script \"\";\n"
+    "property \"Cache size limit (MB)\" entry sourcesep.cache_limit_mb 1024;\n"
+    "property \"Enable verbose logging\" checkbox sourcesep.trace 0;\n";
 
 
 static DB_plugin_action_t mode_action = {
-    .title = "Playback/Toggle Roformer Mode",
-    .name = "roformer_toggle_mode",
+    .title = "Playback/Toggle Source Separation Mode",
+    .name = "sourcesep_toggle_mode",
     .flags = DB_ACTION_COMMON,
     .callback2 = mode_action_cb,
     .next = NULL
@@ -2518,24 +2518,24 @@ static DB_decoder_t plugin = {
     .plugin.version_major = 1,
     .plugin.version_minor = 0,
     .plugin.type = DB_PLUGIN_DECODER,
-    .plugin.id = "roformer",
-    .plugin.name = "Roformer Source Separation",
+    .plugin.id = "sourcesep",
+    .plugin.name = "Source Separation",
     .plugin.descr = "Separates vocals/instrumentals",
     .plugin.copyright =
-        "Roformer plugin for DeaDBeeF\n"
+        "Source Separation\n"
         "Copyright (C) 2026\n",
     .plugin.website = "https://github.com/DeaDBeeF-Player/deadbeef",
-    .plugin.start = roformer_start,
-    .plugin.stop = roformer_stop,
-    .plugin.message = roformer_message,
+    .plugin.start = sourcesep_start,
+    .plugin.stop = sourcesep_stop,
+    .plugin.message = sourcesep_message,
     .plugin.configdialog = settings_dlg,
-    .plugin.get_actions = roformer_get_actions,
-    .open = roformer_open,
-    .init = roformer_init,
-    .free = roformer_free,
-    .read = roformer_read,
-    .seek = roformer_seek,
-    .seek_sample = roformer_seek_sample,
+    .plugin.get_actions = sourcesep_get_actions,
+    .open = sourcesep_open,
+    .init = sourcesep_init,
+    .free = sourcesep_free,
+    .read = sourcesep_read,
+    .seek = sourcesep_seek,
+    .seek_sample = sourcesep_seek_sample,
     .insert = NULL,
     .exts = exts,
 };
