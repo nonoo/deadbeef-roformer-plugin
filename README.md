@@ -1,6 +1,6 @@
 # Roformer Source Separation (DeaDBeeF Plugin)
 
-`roformer.so` is an out-of-tree DeaDBeeF decoder plugin that plays source-separated output from the Mel-Band-Roformer-Vocal-Model project.
+`roformer.so` is an out-of-tree DeaDBeeF decoder plugin that plays source-separated output from the Vocal Separation Script project.
 
 It can switch playback between:
 - original source (`🔊`)
@@ -12,7 +12,7 @@ It can switch playback between:
 - External plugin only (no DeaDBeeF core/source modifications required).
 - Statusbar toggle button with emoji mode indicator.
 - Action: `Playback/Toggle Roformer Mode`.
-- Direct inference execution via `inference.py` streaming float32 PCM.
+- Direct inference execution via a script (e.g. `inference.py`) streaming float32 PCM.
 - Cache in `/tmp/deadbeef-$UID-roformer-cache`.
 - Live raw temp caches (`*.f32tmp*`) are stored separately in `/tmp/deadbeef-$UID-roformer-cache-f32tmp` (lazy-created, cleaned on startup and exit).
 - Cache filename uses the original source filename stem (plus mode suffix): `<name>.instr.mp3` / `<name>.vocal.mp3`.
@@ -46,11 +46,7 @@ Restart DeaDBeeF after install/update.
 
 ## Runtime Requirements
 
-- Python 3 (default executable: `python3`)
-- Mel-Band-Roformer model directory containing:
-  - `inference.py`
-  - `configs/config_vocals_mel_band_roformer.yaml`
-  - `MelBandRoformer.ckpt`
+- Python 3 (required for the default `inference.py` script)
 
 ### Model Setup (required)
 
@@ -64,18 +60,19 @@ git clone https://github.com/nonoo/Mel-Band-Roformer-Vocal-Model
 
 `https://huggingface.co/KimberleyJSN/melbandroformer/blob/main/MelBandRoformer.ckpt`
 
-3. Place `MelBandRoformer.ckpt` into the cloned `Mel-Band-Roformer-Vocal-Model` directory.
+3. Place `MelBandRoformer.ckpt` into the cloned `Vocal Separation Script` directory.
 
-4. In DeaDBeeF plugin settings, set **Mel-Band-Roformer-Vocal-Model directory** to that cloned directory path.
+4. In DeaDBeeF plugin settings, set **Vocal Separation Script** and **Instrumental Separation Script** to the path of `inference.py` (or your specific separation scripts) in that cloned directory.
 
 ## Plugin Configuration
 
 In DeaDBeeF plugin settings:
 
-- **Mel-Band-Roformer-Vocal-Model directory** (`roformer.model_dir`)
+- **Vocal Separation Script** (`roformer.vocal_separation_script`)
+- **Instrumental Separation Script** (`roformer.instrumental_separation_script`)
 - **Enable verbose logging** (`roformer.trace`, default off)
-- **Python executable** (`roformer.python`, default `python3`)
 - **Cache size limit (MB)** (`roformer.cache_limit_mb`, default `1024`)
+
 
 ## Modes and Behavior
 
@@ -114,7 +111,7 @@ If playback stops before inference completes, incomplete cache is removed.
 ## Troubleshooting
 
 - Enable verbose logging (`roformer.trace=1`) and inspect DeaDBeeF log.
-- Verify `roformer.model_dir` points to the correct model repo directory.
-- Verify `python3` (or configured executable) can run `inference.py`.
+- Verify `roformer.vocal_separation_script` points to the correct script path.
+- Verify the script is executable and can run (it's called directly).
 - If needed, clear cache directory:
   - `/tmp/deadbeef-$UID-roformer-cache`

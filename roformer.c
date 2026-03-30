@@ -626,7 +626,9 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *
     }
     FILE *fp = fopen(index_path, "r");
     if (!fp) {
-        trace("roformer: index open failed path=%s errno=%d\n", index_path, errno);
+        if (errno != ENOENT) {
+            trace("roformer: index open failed path=%s errno=%d\n", index_path, errno);
+        }
         return -1;
     }
     char line[PATH_MAX * 2];
@@ -806,32 +808,6 @@ cache_index_prune_invalid(void) {
 }
 
 static int
-normalize_model_dir(char *path, size_t path_sz) {
-    (void)path_sz;
-    if (!path || !path[0]) {
-        return -1;
-    }
-    struct stat st = {0};
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        return 0;
-    }
-    if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-        char *slash = strrchr(path, '/');
-        if (!slash) {
-            return -1;
-        }
-        if (slash == path) {
-            path[1] = 0;
-        }
-        else {
-            *slash = 0;
-        }
-        return 0;
-    }
-    return -1;
-}
-
-static int
 path_list_contains(char **paths, size_t npaths, const char *path) {
     if (!paths || !path) {
         return 0;
@@ -1000,7 +976,10 @@ find_existing_temp_raw_for_cache(const char *cache_final_path, char *out, size_t
         if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
             continue;
         }
-        strncpy(out, full, out_sz - 1);
+        if (out && out_sz > 0) {
+            strncpy(out, full, out_sz);
+            out[out_sz - 1] = 0;
+        }
         closedir(dir);
         return 0;
     }
@@ -1267,55 +1246,86 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
 
-    char model_dir[PATH_MAX];
-    deadbeef->conf_get_str("roformer.model_dir", "", model_dir, sizeof(model_dir));
-    if (!model_dir[0] || normalize_model_dir(model_dir, sizeof(model_dir)) != 0) {
+    char script[PATH_MAX];
+    const char *script_key = mode == ROFORMER_MODE_VOCAL ? "roformer.vocal_separation_script" : "roformer.instrumental_separation_script";
+    deadbeef->conf_get_str(script_key, "", script, sizeof(script));
+    if (!script[0]) {
         return;
     }
-    char inference_path[PATH_MAX];
-    char config_path[PATH_MAX];
-    char model_path[PATH_MAX];
-    if (safe_path_join2(inference_path, sizeof(inference_path), model_dir, "inference.py") != 0
-        || safe_path_join2(config_path, sizeof(config_path), model_dir, "configs/config_vocals_mel_band_roformer.yaml") != 0
-        || safe_path_join2(model_path, sizeof(model_path), model_dir, "MelBandRoformer.ckpt") != 0) {
-        return;
-    }
-    const char *python = deadbeef->conf_get_str_fast("roformer.python", "python3");
 
-    char cmd[PATH_MAX * 8];
-    const char *out_name = mode == ROFORMER_MODE_VOCAL ? "_vocals.mp3" : "_instrumental.mp3";
-    if (snprintf(
-            cmd, sizeof(cmd),
-            "outdir=$(mktemp -d) && "
-            "base=$(basename \"$1\") && stem=${base%%.*} && "
-            "\"%s\" \"%s\" --config_path \"%s\" --model_path \"%s\" --input \"$1\" --store_dir \"$outdir\" --mp3 >/dev/null 2>&1 && "
-            "src=\"$outdir/${stem}%s\" && [ -f \"$src\" ] && cp -f \"$src\" \"$2\"; "
-            "status=$?; rm -rf \"$outdir\"; exit $status",
-            python, inference_path, config_path, model_path, out_name) < 0) {
+    int sr = get_samplerate(it);
+    int ch = get_channels(it);
+    const char *stream_arg = mode == ROFORMER_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
         return;
     }
+
+    trace("roformer: precache spawn inference: \"%s\" --input \"%s\" %s\n", script, uri_copy, stream_arg);
 
     pid_t pid = fork();
-    if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", cmd, "sh", uri_copy, final_path, (char *)NULL);
-        _exit(127);
-    }
-    if (pid <= 0) {
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
         return;
     }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        execlp(script, script, "--input", uri_copy, stream_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    SF_INFO out_sfinfo = {0};
+    out_sfinfo.format = SF_FORMAT_MPEG | SF_FORMAT_MPEG_LAYER_III;
+    out_sfinfo.samplerate = sr;
+    out_sfinfo.channels = ch;
+    SNDFILE *out = sf_open(final_path, SFM_WRITE, &out_sfinfo);
+    if (!out) {
+        trace("roformer: failed to open mp3 for precache: %s, error: %s\n", final_path, sf_strerror(NULL));
+        close(pipefd[0]);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        return;
+    }
+
+    float buf[8192];
+    ssize_t got;
+    size_t frame_sz = ch * 4;
+    while ((got = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        sf_count_t frames = (sf_count_t)(got / frame_sz);
+        if (frames > 0) {
+            sf_writef_float(out, buf, frames);
+        }
+    }
+    close(pipefd[0]);
+    sf_close(out);
+
     int status = 0;
     waitpid(pid, &status, 0);
     if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        trace("roformer: precache inference failed status=%d\n", WEXITSTATUS(status));
         unlink(final_path);
         return;
     }
+
     struct stat st = {0};
     if (stat(final_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 64) {
         unlink(final_path);
         return;
     }
-    int sr = get_samplerate(it);
-    int ch = get_channels(it);
     cache_index_upsert(uri_copy, mode, mtime, size, sr, ch, 1, final_path);
     notify_waveform_refresh_for_source(uri_copy);
     (void)precache_make_room_or_stop();
@@ -1593,7 +1603,8 @@ build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_ou
     }
 
     char stem[PATH_MAX] = {0};
-    strncpy(stem, base, sizeof(stem) - 1);
+    strncpy(stem, base, sizeof(stem));
+    stem[sizeof(stem) - 1] = 0;
     char *dot = strrchr(stem, '.');
     if (dot) {
         *dot = 0;
@@ -1633,25 +1644,37 @@ convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, i
     if (!raw_path || !raw_path[0] || !mp3_path || !mp3_path[0] || samplerate <= 0 || channels <= 0) {
         return -1;
     }
-    char cmd[PATH_MAX * 6];
-    if (snprintf(cmd, sizeof(cmd),
-            "ffmpeg -y -f f32le -ar %d -ac %d -i \"$1\" -codec:a libmp3lame -q:a 0 \"$2\" >/dev/null 2>&1",
-            samplerate, channels) < 0) {
+
+    SF_INFO in_sfinfo = {0};
+    in_sfinfo.format = SF_FORMAT_RAW | SF_FORMAT_FLOAT;
+    in_sfinfo.samplerate = samplerate;
+    in_sfinfo.channels = channels;
+    SNDFILE *in = sf_open(raw_path, SFM_READ, &in_sfinfo);
+    if (!in) {
+        trace("roformer: failed to open raw for conversion: %s, error: %s\n", raw_path, sf_strerror(NULL));
         return -1;
     }
-    pid_t pid = fork();
-    if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", cmd, "sh", raw_path, mp3_path, (char *)NULL);
-        _exit(127);
-    }
-    if (pid <= 0) {
+
+    SF_INFO out_sfinfo = {0};
+    out_sfinfo.format = SF_FORMAT_MPEG | SF_FORMAT_MPEG_LAYER_III;
+    out_sfinfo.samplerate = samplerate;
+    out_sfinfo.channels = channels;
+    SNDFILE *out = sf_open(mp3_path, SFM_WRITE, &out_sfinfo);
+    if (!out) {
+        trace("roformer: failed to open mp3 for conversion: %s, error: %s\n", mp3_path, sf_strerror(NULL));
+        sf_close(in);
         return -1;
     }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return -1;
+
+    float buf[8192];
+    sf_count_t read_frames;
+    while ((read_frames = sf_readf_float(in, buf, 8192 / channels)) > 0) {
+        sf_writef_float(out, buf, read_frames);
     }
-    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+
+    sf_close(in);
+    sf_close(out);
+    return 0;
 }
 
 static int
@@ -1665,29 +1688,16 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
         path = src_uri + 7;
     }
 
-    char model_dir[PATH_MAX];
-    deadbeef->conf_get_str("roformer.model_dir", "", model_dir, sizeof(model_dir));
-    if (!model_dir[0] || normalize_model_dir(model_dir, sizeof(model_dir)) != 0) {
+    char script[PATH_MAX];
+    const char *script_key = mode == ROFORMER_MODE_VOCAL ? "roformer.vocal_separation_script" : "roformer.instrumental_separation_script";
+    deadbeef->conf_get_str(script_key, "", script, sizeof(script));
+    if (!script[0]) {
         return -1;
     }
 
-    char inference_path[PATH_MAX];
-    char config_path[PATH_MAX];
-    char model_path[PATH_MAX];
-    if (safe_path_join2(inference_path, sizeof(inference_path), model_dir, "inference.py") != 0) {
-        return -1;
-    }
-    if (safe_path_join2(config_path, sizeof(config_path), model_dir, "configs/config_vocals_mel_band_roformer.yaml") != 0) {
-        return -1;
-    }
-    if (safe_path_join2(model_path, sizeof(model_path), model_dir, "MelBandRoformer.ckpt") != 0) {
-        return -1;
-    }
-
-    const char *python = deadbeef->conf_get_str_fast("roformer.python", "python3");
     const char *stream_arg = mode == ROFORMER_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
-    trace("roformer: spawn inference mode=%d input=%s python=%s model_dir=%s cache=%s\n",
-        mode, path, python, model_dir, ri->cache_final_path);
+    trace("roformer: spawn inference cmd: \"%s\" --input \"%s\" %s\n",
+        script, path, stream_arg);
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
     if (!cache_dir[0]) {
@@ -1719,10 +1729,7 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
         }
 
         execlp(
-            python, python,
-            inference_path,
-            "--config_path", config_path,
-            "--model_path", model_path,
+            script, script,
             "--input", path,
             stream_arg,
             (char *)NULL
@@ -1937,6 +1944,7 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     if (!cache_dir[0]) {
         return -1;
     }
+    ensure_dir(cache_dir);
 
     deadbeef->pl_lock();
     const char *src = deadbeef->pl_find_meta(it, ":ROFORMER_SOURCE_URI");
@@ -2409,6 +2417,11 @@ roformer_load(DB_functions_t *api) {
 
 static int
 roformer_start(void) {
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (cache_dir[0]) {
+        ensure_dir(cache_dir);
+    }
     roformer_set_mode(ROFORMER_MODE_ORIGINAL);
     if (deadbeef->conf_get_int("roformer.trace", 0)) {
         plugin.plugin.flags |= DDB_PLUGIN_FLAG_LOGGING;
@@ -2467,10 +2480,11 @@ roformer_stop(void) {
 static const char *exts[] = {"wav", "flac", "mp3", NULL};
 
 static const char settings_dlg[] =
-    "property \"Mel-Band-Roformer-Vocal-Model directory\" file roformer.model_dir \"\";\n"
+    "property \"Vocal Separation Script\" file roformer.vocal_separation_script \"\";\n"
+    "property \"Instrumental Separation Script\" file roformer.instrumental_separation_script \"\";\n"
     "property \"Cache size limit (MB)\" entry roformer.cache_limit_mb 1024;\n"
-    "property \"Enable verbose logging\" checkbox roformer.trace 0;\n"
-    "property \"Python executable\" entry roformer.python \"python3\";\n";
+    "property \"Enable verbose logging\" checkbox roformer.trace 0;\n";
+
 
 static DB_plugin_action_t mode_action = {
     .title = "Playback/Toggle Roformer Mode",
