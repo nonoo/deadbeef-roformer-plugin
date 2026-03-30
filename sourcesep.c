@@ -24,13 +24,17 @@ extern char **environ;
 
 static DB_functions_t *deadbeef;
 static DB_decoder_t plugin;
+static float restart_pos = -1.0f;
+static char restart_uri[PATH_MAX] = {0};
+
 static int sourcesep_seek_sample(DB_fileinfo_t *_info, int sample);
 static int get_samplerate(DB_playItem_t *it);
 static int get_channels(DB_playItem_t *it);
 static void notify_waveform_refresh_for_source(const char *source_uri);
+static int uri_protected_from_precache_eviction(const char *uri);
 static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
 static int resolve_cache_final_path(DB_playItem_t *it, int mode, char *out, size_t out_sz);
-static void cache_index_rewrite_with_filter(const char *remove_cache_path);
+static void cache_index_rewrite_with_filter(const char *remove_cache_path, int mode);
 static int convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, int channels);
 
 #define SOURCESEP_MODE_ORIGINAL 0
@@ -486,9 +490,9 @@ cache_remove_unrelated_files(void) {
         if (cache_index_find_uri_by_cache_file(full, uri, sizeof(uri)) != 0 || !uri[0]) {
             continue;
         }
-        if (!uri_in_current_playlist(uri) && !uri_is_currently_playing_or_loaded(uri)) {
+        if (!uri_protected_from_precache_eviction(uri) && !uri_is_currently_playing_or_loaded(uri)) {
             if (unlink(full) == 0) {
-                cache_index_rewrite_with_filter(full);
+                cache_index_rewrite_with_filter(full, -1);
                 trace("sourcesep: removed unrelated cache %s uri=%s\n", full, uri);
             }
         }
@@ -601,7 +605,7 @@ precache_make_room_or_stop(void) {
         }
 
         if (unlink(oldest.path) == 0) {
-            cache_index_rewrite_with_filter(oldest.path);
+            cache_index_rewrite_with_filter(oldest.path, -1);
             trace("sourcesep: precache evicted oldest cache %s\n", oldest.path);
         }
         else {
@@ -664,7 +668,7 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *
 }
 
 static void
-cache_index_rewrite_with_filter(const char *remove_cache_path) {
+cache_index_rewrite_with_filter(const char *remove_cache_path, int mode) {
     char index_path[PATH_MAX];
     char cache_dir[PATH_MAX];
     if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
@@ -711,7 +715,9 @@ cache_index_rewrite_with_filter(const char *remove_cache_path) {
             continue;
         }
         if (remove_cache_path && !strcmp(e.cache_file, remove_cache_path)) {
-            continue;
+            if (mode < 0 || e.mode == mode) {
+                continue;
+            }
         }
         fputs(line, out);
     }
@@ -730,7 +736,7 @@ cache_index_upsert(const char *uri, int mode, int64_t mtime, int64_t size, int s
         return;
     }
     ensure_dir(cache_dir);
-    cache_index_rewrite_with_filter(cache_file);
+    cache_index_rewrite_with_filter(cache_file, mode);
     char index_path[PATH_MAX];
     if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
         return;
@@ -1077,7 +1083,7 @@ cache_enforce_limit(void) {
     qsort(entries, nentries, sizeof(cache_entry_t), cache_entry_cmp);
     for (size_t i = 0; i < nentries && total > limit_bytes; i++) {
         if (unlink(entries[i].path) == 0) {
-            cache_index_rewrite_with_filter(entries[i].path);
+            cache_index_rewrite_with_filter(entries[i].path, -1);
             total -= entries[i].size;
         }
     }
@@ -1125,8 +1131,13 @@ apply_mode_to_track(DB_playItem_t *it, int mode) {
         }
         deadbeef->pl_unlock();
 
-        if (current_copy[0] && !strcmp(current_copy, plugin.plugin.id) && orig_copy[0]) {
-            deadbeef->pl_replace_meta(it, ":DECODER", orig_copy);
+        if (current_copy[0] && !strcmp(current_copy, plugin.plugin.id)) {
+            if (orig_copy[0]) {
+                deadbeef->pl_replace_meta(it, ":DECODER", orig_copy);
+            }
+            else {
+                deadbeef->pl_delete_meta(it, ":DECODER");
+            }
         }
         deadbeef->pl_delete_meta(it, ":SOURCESEP_ORIG_DECODER");
         deadbeef->pl_delete_meta(it, ":SOURCESEP_SOURCE_URI");
@@ -1141,14 +1152,10 @@ apply_mode_to_track(DB_playItem_t *it, int mode) {
 }
 
 static void
-apply_mode_to_current_playlist(int mode) {
-    deadbeef->pl_lock();
-    ddb_playlist_t *plt = deadbeef->plt_get_curr();
-    deadbeef->pl_unlock();
+apply_mode_to_playlist(ddb_playlist_t *plt, int mode) {
     if (!plt) {
         return;
     }
-
     deadbeef->pl_lock();
     DB_playItem_t *it = deadbeef->plt_get_first(plt, PL_MAIN);
     deadbeef->pl_unlock();
@@ -1160,8 +1167,19 @@ apply_mode_to_current_playlist(int mode) {
         deadbeef->pl_item_unref(it);
         it = next;
     }
-    deadbeef->plt_unref(plt);
-    deadbeef->sendmessage(DB_EV_PLAYLISTCHANGED, 0, DDB_PLAYLIST_CHANGE_CONTENT, 0);
+    deadbeef->sendmessage(DB_EV_PLAYLISTCHANGED, 0, DDB_PLAYLIST_CHANGE_CONTENT, (uintptr_t)plt);
+}
+
+static void
+apply_mode_to_all_playlists(int mode) {
+    int count = deadbeef->plt_get_count();
+    for (int i = 0; i < count; i++) {
+        ddb_playlist_t *plt = deadbeef->plt_get_for_idx(i);
+        if (plt) {
+            apply_mode_to_playlist(plt, mode);
+            deadbeef->plt_unref(plt);
+        }
+    }
 }
 
 static void
@@ -1179,13 +1197,11 @@ restart_if_playing(void) {
 static void
 ensure_playing_track_mode(void) {
     int mode = sourcesep_get_mode();
-    if (mode == SOURCESEP_MODE_ORIGINAL) {
-        return;
-    }
     DB_playItem_t *it = deadbeef->streamer_get_playing_track_safe();
     if (!it) {
         return;
     }
+
     deadbeef->pl_lock();
     const char *decoder = deadbeef->pl_find_meta(it, ":DECODER");
     char decoder_copy[128] = {0};
@@ -1193,9 +1209,20 @@ ensure_playing_track_mode(void) {
         strncpy(decoder_copy, decoder, sizeof(decoder_copy) - 1);
     }
     deadbeef->pl_unlock();
-    if (!decoder_copy[0] || strcmp(decoder_copy, plugin.plugin.id)) {
-        apply_mode_to_track(it, mode);
-        deadbeef->sendmessage(DB_EV_PLAY_CURRENT, 0, 0, 0);
+
+    int is_us = decoder_copy[0] && !strcmp(decoder_copy, plugin.plugin.id);
+
+    if (mode == SOURCESEP_MODE_ORIGINAL) {
+        if (is_us) {
+            apply_mode_to_track(it, mode);
+            deadbeef->sendmessage(DB_EV_PLAY_CURRENT, 0, 0, 0);
+        }
+    }
+    else {
+        if (!is_us) {
+            apply_mode_to_track(it, mode);
+            deadbeef->sendmessage(DB_EV_PLAY_CURRENT, 0, 0, 0);
+        }
     }
     deadbeef->pl_item_unref(it);
 }
@@ -1449,7 +1476,7 @@ cycle_mode(void) {
     mode = (mode + 1) % 3;
     sourcesep_set_mode(mode);
     update_button_label();
-    apply_mode_to_current_playlist(mode);
+    apply_mode_to_all_playlists(mode);
     restart_if_playing();
     schedule_precache_rescan();
     return mode;
@@ -1955,6 +1982,8 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     deadbeef->pl_item_ref(it);
     ri->mode = sourcesep_get_mode();
     if (ri->mode == SOURCESEP_MODE_ORIGINAL) {
+        apply_mode_to_track(it, SOURCESEP_MODE_ORIGINAL);
+        trace("sourcesep: init passthrough for %s\n", ri->source_uri);
         return -1;
     }
 
@@ -2441,7 +2470,6 @@ sourcesep_start(void) {
     if (cache_dir[0]) {
         ensure_dir(cache_dir);
     }
-    sourcesep_set_mode(SOURCESEP_MODE_ORIGINAL);
     if (deadbeef->conf_get_int("sourcesep.trace", 0)) {
         plugin.plugin.flags |= DDB_PLUGIN_FLAG_LOGGING;
     }
@@ -2454,10 +2482,7 @@ sourcesep_start(void) {
     cache_remove_stale_temp_files();
     try_install_gui_button();
     update_button_label();
-    int mode = sourcesep_get_mode();
-    if (mode != SOURCESEP_MODE_ORIGINAL) {
-        apply_mode_to_current_playlist(mode);
-    }
+    apply_mode_to_all_playlists(sourcesep_get_mode());
     schedule_precache_rescan();
     return 0;
 }
@@ -2476,10 +2501,28 @@ sourcesep_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
         }
         try_install_gui_button();
         update_button_label();
+        apply_mode_to_all_playlists(sourcesep_get_mode());
         schedule_precache_rescan();
     }
     if (id == DB_EV_SONGSTARTED) {
         ensure_playing_track_mode();
+        if (restart_pos >= 0) {
+            DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
+            if (playing) {
+                int match = 0;
+                deadbeef->pl_lock();
+                const char *uri = deadbeef->pl_find_meta(playing, ":URI");
+                if (uri && !strcmp(uri, restart_uri)) {
+                    match = 1;
+                }
+                deadbeef->pl_unlock();
+                if (match) {
+                    deadbeef->sendmessage(DB_EV_SEEK, 0, (uint32_t)(restart_pos * 1000), 0);
+                }
+                deadbeef->pl_item_unref(playing);
+            }
+            restart_pos = -1;
+        }
         schedule_precache_rescan();
     }
     if (id == DB_EV_PLAYLISTCHANGED) {
