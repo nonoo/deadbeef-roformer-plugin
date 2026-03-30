@@ -317,18 +317,18 @@ index_parse_line(char *line, cache_index_entry_t *e) {
     if (!tok) return -1;
     if (tok[0] == '/') {
         e->complete = 1;
-        strncpy(e->cache_file, tok, sizeof(e->cache_file) - 1);
+        snprintf(e->cache_file, sizeof(e->cache_file), "%s", tok);
     }
     else {
         e->complete = atoi(tok);
         tok = strtok_r(NULL, "\t", &save);
         if (!tok) return -1;
-        strncpy(e->cache_file, tok, sizeof(e->cache_file) - 1);
+        snprintf(e->cache_file, sizeof(e->cache_file), "%s", tok);
     }
 
     tok = strtok_r(NULL, "\t", &save);
     if (!tok) return -1;
-    strncpy(e->uri, tok, sizeof(e->uri) - 1);
+    snprintf(e->uri, sizeof(e->uri), "%s", tok);
     if (e->samplerate <= 0 || e->channels <= 0 || e->channels > 8) {
         return -1;
     }
@@ -398,7 +398,7 @@ get_track_source_uri(DB_playItem_t *it, char *uri_out, size_t uri_out_sz) {
         src = deadbeef->pl_find_meta(it, ":URI");
     }
     if (src) {
-        strncpy(uri_out, src, uri_out_sz - 1);
+        snprintf(uri_out, uri_out_sz, "%s", src);
     }
     deadbeef->pl_unlock();
     return uri_out[0] ? 0 : -1;
@@ -551,8 +551,7 @@ precache_make_room_or_stop(void) {
             }
             total += st.st_size;
             if (!have_oldest || st.st_mtime < oldest.mtime) {
-                strncpy(oldest.path, full, sizeof(oldest.path) - 1);
-                oldest.path[sizeof(oldest.path) - 1] = 0;
+                snprintf(oldest.path, sizeof(oldest.path), "%s", full);
                 oldest.mtime = st.st_mtime;
                 oldest.size = st.st_size;
                 have_oldest = 1;
@@ -677,8 +676,7 @@ cache_index_rewrite_with_filter(const char *remove_cache_path, int mode) {
             continue;
         }
         char line_copy[PATH_MAX * 2];
-        strncpy(line_copy, line, sizeof(line_copy) - 1);
-        line_copy[sizeof(line_copy) - 1] = 0;
+        snprintf(line_copy, sizeof(line_copy), "%s", line);
         if (index_parse_line(line_copy, &e) != 0) {
             continue;
         }
@@ -763,8 +761,7 @@ cache_index_prune_invalid(void) {
             continue;
         }
         char line_copy[PATH_MAX * 2];
-        strncpy(line_copy, line, sizeof(line_copy) - 1);
-        line_copy[sizeof(line_copy) - 1] = 0;
+        snprintf(line_copy, sizeof(line_copy), "%s", line);
         if (index_parse_line(line_copy, &e) != 0) {
             continue;
         }
@@ -951,8 +948,7 @@ find_existing_temp_raw_for_cache(const char *cache_final_path, char *out, size_t
             continue;
         }
         if (out && out_sz > 0) {
-            strncpy(out, full, out_sz);
-            out[out_sz - 1] = 0;
+            snprintf(out, out_sz, "%s", full);
         }
         closedir(dir);
         return 0;
@@ -1032,8 +1028,7 @@ cache_enforce_limit(void) {
                 return;
             }
         }
-        strncpy(entries[nentries].path, full, sizeof(entries[nentries].path));
-        entries[nentries].path[sizeof(entries[nentries].path) - 1] = 0;
+        snprintf(entries[nentries].path, sizeof(entries[nentries].path), "%s", full);
         entries[nentries].mtime = st.st_mtime;
         entries[nentries].size = st.st_size;
         total += st.st_size;
@@ -1074,10 +1069,10 @@ apply_mode_to_track(DB_playItem_t *it, int mode) {
     char decoder_copy[128] = {0};
     char uri_copy[PATH_MAX] = {0};
     if (decoder) {
-        strncpy(decoder_copy, decoder, sizeof(decoder_copy) - 1);
+        snprintf(decoder_copy, sizeof(decoder_copy), "%s", decoder);
     }
     if (uri) {
-        strncpy(uri_copy, uri, sizeof(uri_copy) - 1);
+        snprintf(uri_copy, sizeof(uri_copy), "%s", uri);
     }
     deadbeef->pl_unlock();
 
@@ -1092,10 +1087,10 @@ apply_mode_to_track(DB_playItem_t *it, int mode) {
         char orig_copy[128] = {0};
         char current_copy[128] = {0};
         if (orig_dec) {
-            strncpy(orig_copy, orig_dec, sizeof(orig_copy) - 1);
+            snprintf(orig_copy, sizeof(orig_copy), "%s", orig_dec);
         }
         if (current_dec) {
-            strncpy(current_copy, current_dec, sizeof(current_copy) - 1);
+            snprintf(current_copy, sizeof(current_copy), "%s", current_dec);
         }
         deadbeef->pl_unlock();
 
@@ -1163,8 +1158,7 @@ restart_if_playing(void) {
             deadbeef->pl_lock();
             const char *uri = deadbeef->pl_find_meta(it, ":URI");
             if (uri) {
-                strncpy(restart_uri, uri, sizeof(restart_uri) - 1);
-                restart_uri[sizeof(restart_uri) - 1] = 0;
+                snprintf(restart_uri, sizeof(restart_uri), "%s", uri);
                 restart_pos = deadbeef->streamer_get_playpos();
                 trace("sourcesep: captured restart position %.2f for %s\n", restart_pos, restart_uri);
             }
@@ -1187,7 +1181,7 @@ ensure_playing_track_mode(void) {
     const char *decoder = deadbeef->pl_find_meta(it, ":DECODER");
     char decoder_copy[128] = {0};
     if (decoder) {
-        strncpy(decoder_copy, decoder, sizeof(decoder_copy) - 1);
+        snprintf(decoder_copy, sizeof(decoder_copy), "%s", decoder);
     }
     deadbeef->pl_unlock();
 
@@ -1220,7 +1214,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
     const char *uri = deadbeef->pl_find_meta(it, ":URI");
     char uri_copy[PATH_MAX] = {0};
     if (uri) {
-        strncpy(uri_copy, uri, sizeof(uri_copy) - 1);
+        snprintf(uri_copy, sizeof(uri_copy), "%s", uri);
     }
     deadbeef->pl_unlock();
     if (!uri_copy[0]) {
@@ -1610,7 +1604,7 @@ build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_ou
     }
     char uri_copy[PATH_MAX] = {0};
     if (uri) {
-        strncpy(uri_copy, uri, sizeof(uri_copy) - 1);
+        snprintf(uri_copy, sizeof(uri_copy), "%s", uri);
     }
     deadbeef->pl_unlock();
 
@@ -1625,8 +1619,7 @@ build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_ou
     }
 
     char stem[PATH_MAX] = {0};
-    strncpy(stem, base, sizeof(stem));
-    stem[sizeof(stem) - 1] = 0;
+    snprintf(stem, sizeof(stem), "%s", base);
     char *dot = strrchr(stem, '.');
     if (dot) {
         *dot = 0;
@@ -1635,7 +1628,7 @@ build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_ou
     char safe_stem[PATH_MAX] = {0};
     sanitize_filename_component(stem, safe_stem, sizeof(safe_stem));
     if (!safe_stem[0]) {
-        strncpy(safe_stem, "track", sizeof(safe_stem) - 1);
+        snprintf(safe_stem, sizeof(safe_stem), "track");
     }
 
     const char *suffix = mode == SOURCESEP_MODE_VOCAL ? ".vocal.mp3" : ".instr.mp3";
@@ -1992,7 +1985,7 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
         src = deadbeef->pl_find_meta(it, ":URI");
     }
     if (src) {
-        strncpy(ri->source_uri, src, sizeof(ri->source_uri) - 1);
+        snprintf(ri->source_uri, sizeof(ri->source_uri), "%s", src);
     }
     deadbeef->pl_unlock();
     if (!ri->source_uri[0]) {
@@ -2168,9 +2161,9 @@ finish_stream(sourcesep_info_t *ri, int aborted) {
         if (!aborted && child_ok && ri->cache_raw_path[0]) {
             cache_finalize_task_t *task = calloc(1, sizeof(cache_finalize_task_t));
             if (task) {
-                strncpy(task->raw_path, ri->cache_raw_path, sizeof(task->raw_path) - 1);
-                strncpy(task->final_path, ri->cache_final_path, sizeof(task->final_path) - 1);
-                strncpy(task->source_uri, ri->source_uri, sizeof(task->source_uri) - 1);
+                snprintf(task->raw_path, sizeof(task->raw_path), "%s", ri->cache_raw_path);
+                snprintf(task->final_path, sizeof(task->final_path), "%s", ri->cache_final_path);
+                snprintf(task->source_uri, sizeof(task->source_uri), "%s", ri->source_uri);
                 task->source_mtime = ri->source_mtime;
                 task->source_size = ri->source_size;
                 task->samplerate = ri->samplerate;
@@ -2300,7 +2293,7 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
                     playing_src = deadbeef->pl_find_meta(playing, ":URI");
                 }
                 if (playing_src) {
-                    strncpy(playing_src_copy, playing_src, sizeof(playing_src_copy) - 1);
+                    snprintf(playing_src_copy, sizeof(playing_src_copy), "%s", playing_src);
                 }
                 deadbeef->pl_unlock();
                 if (playing_src_copy[0] && !strcmp(playing_src_copy, ri->source_uri)) {
