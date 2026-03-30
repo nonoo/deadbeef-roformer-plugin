@@ -14,9 +14,12 @@ It can switch playback between:
 - Action: `Playback/Toggle Roformer Mode`.
 - Direct inference execution via `inference.py` streaming float32 PCM.
 - Cache in `/tmp/deadbeef-$UID-roformer-cache`.
+- Cache directory is created lazily on first write (not on plugin load).
 - Persistent `index.txt` cache map across restarts.
 - Cache size limit in MB (`roformer.cache_limit_mb`, default 1024).
+- During cache evaluation, roformer first removes cache files not related to current playback context (not in current playlist and not currently playing/loaded).
 - During precache overflow, oldest cache is evicted unless it belongs to the current playing entry or any entry after it in the current playlist; in that case precaching pauses.
+- Cache directory is removed when DeaDBeeF exits (plugin stop).
 - Optional verbose logging to DeaDBeeF internal log (`roformer.trace=1`).
 
 ## Build

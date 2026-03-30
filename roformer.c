@@ -187,7 +187,6 @@ get_cache_dir(char *out, size_t out_sz) {
         out[0] = 0;
         return;
     }
-    ensure_dir(out);
 }
 
 static int
@@ -383,6 +382,120 @@ cache_index_find_uri_by_cache_file(const char *cache_file, char *uri_out, size_t
 }
 
 static int
+get_track_source_uri(DB_playItem_t *it, char *uri_out, size_t uri_out_sz) {
+    if (!it || !uri_out || uri_out_sz == 0) {
+        return -1;
+    }
+    uri_out[0] = 0;
+    deadbeef->pl_lock();
+    const char *src = deadbeef->pl_find_meta(it, ":ROFORMER_SOURCE_URI");
+    if (!src) {
+        src = deadbeef->pl_find_meta(it, ":URI");
+    }
+    if (src) {
+        strncpy(uri_out, src, uri_out_sz - 1);
+    }
+    deadbeef->pl_unlock();
+    return uri_out[0] ? 0 : -1;
+}
+
+static int
+uri_in_current_playlist(const char *uri) {
+    if (!uri || !uri[0]) {
+        return 0;
+    }
+    deadbeef->pl_lock();
+    ddb_playlist_t *plt = deadbeef->plt_get_curr();
+    deadbeef->pl_unlock();
+    if (!plt) {
+        return 0;
+    }
+    deadbeef->pl_lock();
+    DB_playItem_t *it = deadbeef->plt_get_first(plt, PL_MAIN);
+    deadbeef->pl_unlock();
+    int found = 0;
+    while (it) {
+        char it_uri[PATH_MAX] = {0};
+        get_track_source_uri(it, it_uri, sizeof(it_uri));
+        deadbeef->pl_lock();
+        DB_playItem_t *next = deadbeef->pl_get_next(it, PL_MAIN);
+        deadbeef->pl_unlock();
+        deadbeef->pl_item_unref(it);
+        it = next;
+        if (it_uri[0] && !strcmp(it_uri, uri)) {
+            found = 1;
+            break;
+        }
+    }
+    deadbeef->plt_unref(plt);
+    return found;
+}
+
+static int
+uri_is_currently_playing_or_loaded(const char *uri) {
+    if (!uri || !uri[0]) {
+        return 0;
+    }
+    DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
+    if (playing) {
+        char playing_uri[PATH_MAX] = {0};
+        get_track_source_uri(playing, playing_uri, sizeof(playing_uri));
+        deadbeef->pl_item_unref(playing);
+        if (playing_uri[0] && !strcmp(playing_uri, uri)) {
+            return 1;
+        }
+    }
+    DB_playItem_t *streaming = deadbeef->streamer_get_streaming_track();
+    if (streaming) {
+        char streaming_uri[PATH_MAX] = {0};
+        get_track_source_uri(streaming, streaming_uri, sizeof(streaming_uri));
+        deadbeef->pl_item_unref(streaming);
+        if (streaming_uri[0] && !strcmp(streaming_uri, uri)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void
+cache_remove_unrelated_files(void) {
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return;
+    }
+    DIR *dir = opendir(cache_dir);
+    if (!dir) {
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.' || !strcmp(de->d_name, "index.txt")) {
+            continue;
+        }
+        char full[PATH_MAX];
+        if (safe_path_join2(full, sizeof(full), cache_dir, de->d_name) != 0) {
+            continue;
+        }
+        struct stat st = {0};
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        char uri[PATH_MAX] = {0};
+        if (cache_index_find_uri_by_cache_file(full, uri, sizeof(uri)) != 0 || !uri[0]) {
+            continue;
+        }
+        if (!uri_in_current_playlist(uri) && !uri_is_currently_playing_or_loaded(uri)) {
+            if (unlink(full) == 0) {
+                cache_index_rewrite_with_filter(full);
+                trace("roformer: removed unrelated cache %s uri=%s\n", full, uri);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+static int
 uri_protected_from_precache_eviction(const char *uri) {
     if (!uri || !uri[0]) {
         return 0;
@@ -390,12 +503,7 @@ uri_protected_from_precache_eviction(const char *uri) {
     DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
     char playing_uri[PATH_MAX] = {0};
     if (playing) {
-        deadbeef->pl_lock();
-        const char *puri = deadbeef->pl_find_meta(playing, ":URI");
-        if (puri) {
-            strncpy(playing_uri, puri, sizeof(playing_uri) - 1);
-        }
-        deadbeef->pl_unlock();
+        get_track_source_uri(playing, playing_uri, sizeof(playing_uri));
         deadbeef->pl_item_unref(playing);
     }
 
@@ -411,13 +519,8 @@ uri_protected_from_precache_eviction(const char *uri) {
     int found = 0;
     int seen_playing = playing_uri[0] ? 0 : 1;
     while (it) {
-        deadbeef->pl_lock();
-        const char *it_uri = deadbeef->pl_find_meta(it, ":URI");
         char copy[PATH_MAX] = {0};
-        if (it_uri) {
-            strncpy(copy, it_uri, sizeof(copy) - 1);
-        }
-        deadbeef->pl_unlock();
+        get_track_source_uri(it, copy, sizeof(copy));
         if (!seen_playing && copy[0] && !strcmp(copy, playing_uri)) {
             seen_playing = 1;
         }
@@ -437,6 +540,7 @@ uri_protected_from_precache_eviction(const char *uri) {
 
 static int
 precache_make_room_or_stop(void) {
+    cache_remove_unrelated_files();
     int limit_mb = deadbeef->conf_get_int("roformer.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
     if (limit_mb < 1) {
         limit_mb = 1;
@@ -451,7 +555,7 @@ precache_make_room_or_stop(void) {
     while (1) {
         DIR *dir = opendir(cache_dir);
         if (!dir) {
-            return 0;
+            return errno == ENOENT ? 1 : 0;
         }
         int64_t total = 0;
         cache_entry_t oldest = {0};
@@ -567,6 +671,7 @@ cache_index_rewrite_with_filter(const char *remove_cache_path) {
     if (!cache_dir[0]) {
         return;
     }
+    ensure_dir(cache_dir);
     char tmp_name[64];
     if (snprintf(tmp_name, sizeof(tmp_name), "index.txt.tmp.%d", (int)getpid()) < 0) {
         return;
@@ -616,6 +721,12 @@ cache_index_rewrite_with_filter(const char *remove_cache_path) {
 
 static void
 cache_index_upsert(const char *uri, int mode, int64_t mtime, int64_t size, int samplerate, int channels, int complete, const char *cache_file) {
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return;
+    }
+    ensure_dir(cache_dir);
     cache_index_rewrite_with_filter(cache_file);
     char index_path[PATH_MAX];
     if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
@@ -801,6 +912,32 @@ cache_remove_unindexed_wavs(void) {
     free(indexed);
 }
 
+static void
+cache_remove_dir_all(void) {
+    char cache_dir[PATH_MAX];
+    int n = snprintf(cache_dir, sizeof(cache_dir), "/tmp/deadbeef-%d-roformer-cache", (int)getuid());
+    if (n < 0 || (size_t)n >= sizeof(cache_dir)) {
+        return;
+    }
+    DIR *dir = opendir(cache_dir);
+    if (!dir) {
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+        char full[PATH_MAX];
+        if (safe_path_join2(full, sizeof(full), cache_dir, de->d_name) != 0) {
+            continue;
+        }
+        unlink(full);
+    }
+    closedir(dir);
+    rmdir(cache_dir);
+}
+
 static int
 cache_entry_cmp(const void *a, const void *b) {
     const cache_entry_t *ea = a;
@@ -816,6 +953,7 @@ cache_entry_cmp(const void *a, const void *b) {
 
 static void
 cache_enforce_limit(void) {
+    cache_remove_unrelated_files();
     int limit_mb = deadbeef->conf_get_int("roformer.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
     if (limit_mb < 1) {
         limit_mb = 1;
@@ -1033,6 +1171,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
     if (!cache_dir[0]) {
         return;
     }
+    ensure_dir(cache_dir);
     char key[64];
     build_cache_key(it, mode, key, sizeof(key));
     char final_name[80];
@@ -1391,6 +1530,12 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
     const char *stream_arg = mode == ROFORMER_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
     trace("roformer: spawn inference mode=%d input=%s python=%s model_dir=%s cache=%s\n",
         mode, path, python, model_dir, ri->cache_final_path);
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return -1;
+    }
+    ensure_dir(cache_dir);
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -2020,6 +2165,7 @@ roformer_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
 
 static int
 roformer_stop(void) {
+    cache_remove_dir_all();
     mode_button = NULL;
     gtkui_api = NULL;
     return 0;
