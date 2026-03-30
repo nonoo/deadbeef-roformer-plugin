@@ -1454,15 +1454,7 @@ schedule_precache_rescan(void) {
 static int
 cycle_mode(void) {
     int mode = sourcesep_get_mode();
-    if (mode == SOURCESEP_MODE_ORIGINAL) {
-        mode = SOURCESEP_MODE_VOCAL;
-    }
-    else if (mode == SOURCESEP_MODE_VOCAL) {
-        mode = SOURCESEP_MODE_INSTRUMENTAL;
-    }
-    else {
-        mode = SOURCESEP_MODE_ORIGINAL;
-    }
+    mode = (mode + 1) % 3;
     sourcesep_set_mode(mode);
     update_button_label();
     apply_mode_to_all_playlists(mode);
@@ -2089,6 +2081,59 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     return 0;
 }
 
+typedef struct {
+    char raw_path[PATH_MAX];
+    char final_path[PATH_MAX];
+    char source_uri[PATH_MAX];
+    int64_t source_mtime;
+    int64_t source_size;
+    int samplerate;
+    int channels;
+    int mode;
+} cache_finalize_task_t;
+
+static void
+background_finalize_cache(void *ctx) {
+    cache_finalize_task_t *task = (cache_finalize_task_t *)ctx;
+    char mp3_tmp_path[PATH_MAX];
+    if (snprintf(mp3_tmp_path, sizeof(mp3_tmp_path), "%s.mp3tmp.%d.%llx",
+            task->final_path, (int)getpid(), (unsigned long long)(uintptr_t)task) < 0) {
+        free(task);
+        return;
+    }
+
+    if (convert_raw_to_mp3(task->raw_path, mp3_tmp_path, task->samplerate, task->channels) == 0) {
+        struct stat st = {0};
+        if (stat(mp3_tmp_path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 64) {
+            if (rename(mp3_tmp_path, task->final_path) == 0) {
+                cache_index_upsert(
+                    task->source_uri,
+                    task->mode,
+                    task->source_mtime,
+                    task->source_size,
+                    task->samplerate,
+                    task->channels,
+                    1,
+                    task->final_path);
+                trace("sourcesep: background cache finalized %s\n", task->final_path);
+                notify_waveform_refresh_for_source(task->source_uri);
+            }
+            else {
+                trace("sourcesep: background failed to rename %s -> %s errno=%d\n", mp3_tmp_path, task->final_path, errno);
+                unlink(mp3_tmp_path);
+            }
+        }
+        else {
+            trace("sourcesep: background mp3 temp too small %s\n", mp3_tmp_path);
+            unlink(mp3_tmp_path);
+        }
+    }
+    else {
+        trace("sourcesep: background failed to convert raw to mp3 %s\n", task->raw_path);
+    }
+    free(task);
+}
+
 static void
 finish_stream(sourcesep_info_t *ri, int aborted) {
     if (ri->stream_finished) {
@@ -2120,45 +2165,26 @@ finish_stream(sourcesep_info_t *ri, int aborted) {
         fclose(ri->cache_fp_write);
         ri->cache_fp_write = NULL;
 
-        int convert_ok = !aborted && child_ok;
-        char mp3_tmp_path[PATH_MAX] = {0};
-        if (convert_ok) {
-            if (snprintf(mp3_tmp_path, sizeof(mp3_tmp_path), "%s.mp3tmp.%d.%llx",
-                    ri->cache_final_path, (int)getpid(), (unsigned long long)(uintptr_t)ri) < 0) {
-                convert_ok = 0;
-            }
-        }
-
-        if (convert_ok) {
-            convert_ok = convert_raw_to_mp3(ri->cache_raw_path, mp3_tmp_path, ri->samplerate, ri->channels) == 0;
-            if (!convert_ok) {
-                trace("sourcesep: failed to convert raw to mp3 %s -> %s\n", ri->cache_raw_path, mp3_tmp_path);
-            }
-        }
-
-        int finalized = 0;
-        int keep_raw_for_playback = 0;
-        if (convert_ok) {
-            struct stat st = {0};
-            int have_size = stat(mp3_tmp_path, &st) == 0 && S_ISREG(st.st_mode);
-            int enough_data = have_size && st.st_size >= 64;
-            if (enough_data && rename(mp3_tmp_path, ri->cache_final_path) == 0) {
-                finalized = 1;
-            }
-            else {
-                if (!enough_data) {
-                    trace("sourcesep: mp3 temp too small for finalize %s\n", mp3_tmp_path);
+        if (!aborted && child_ok && ri->cache_raw_path[0]) {
+            cache_finalize_task_t *task = calloc(1, sizeof(cache_finalize_task_t));
+            if (task) {
+                strncpy(task->raw_path, ri->cache_raw_path, sizeof(task->raw_path) - 1);
+                strncpy(task->final_path, ri->cache_final_path, sizeof(task->final_path) - 1);
+                strncpy(task->source_uri, ri->source_uri, sizeof(task->source_uri) - 1);
+                task->source_mtime = ri->source_mtime;
+                task->source_size = ri->source_size;
+                task->samplerate = ri->samplerate;
+                task->channels = ri->channels;
+                task->mode = ri->mode;
+                intptr_t tid = deadbeef->thread_start_low_priority(background_finalize_cache, task);
+                if (tid) {
+                    deadbeef->thread_detach(tid);
+                    trace("sourcesep: spawned background conversion for %s\n", task->raw_path);
                 }
                 else {
-                    trace("sourcesep: failed to rename %s -> %s errno=%d\n", mp3_tmp_path, ri->cache_final_path, errno);
+                    free(task);
                 }
-                unlink(mp3_tmp_path);
-                convert_ok = 0;
             }
-        }
-
-        if (!aborted && child_ok) {
-            keep_raw_for_playback = 1;
         }
 
         if (ri->cache_snd) {
@@ -2166,58 +2192,27 @@ finish_stream(sourcesep_info_t *ri, int aborted) {
             ri->cache_snd = NULL;
         }
 
-        if (finalized) {
-            ri->cache_valid = 1;
-            ri->cache_data_offset = 0;
-            cache_index_upsert(
-                ri->source_uri,
-                ri->mode,
-                ri->source_mtime,
-                ri->source_size,
-                ri->samplerate,
-                ri->channels,
-                1,
-                ri->cache_final_path);
-            trace("sourcesep: cache finalized %s\n", ri->cache_final_path);
+        if (ri->cache_fp) {
+            fclose(ri->cache_fp);
+            ri->cache_fp = NULL;
+        }
+        if (ri->cache_raw_path[0]) {
+            ri->cache_fp = fopen(ri->cache_raw_path, "rb");
+            if (ri->cache_fp) {
+                struct stat rst = {0};
+                if (stat(ri->cache_raw_path, &rst) == 0 && S_ISREG(rst.st_mode)) {
+                    ri->cache_bytes_written = rst.st_size;
+                }
+                ri->using_cache = 1;
+            }
         }
 
-        if (keep_raw_for_playback) {
-            if (ri->cache_fp) {
-                fclose(ri->cache_fp);
-                ri->cache_fp = NULL;
-            }
-            if (ri->cache_raw_path[0]) {
-                ri->cache_fp = fopen(ri->cache_raw_path, "rb");
-                if (ri->cache_fp) {
-                    struct stat rst = {0};
-                    if (stat(ri->cache_raw_path, &rst) == 0 && S_ISREG(rst.st_mode)) {
-                        ri->cache_bytes_written = rst.st_size;
-                    }
-                    ri->using_cache = 1;
-                }
-            }
-        }
-        else {
+        if (aborted || !child_ok) {
             if (ri->owns_temp_cache && ri->cache_raw_path[0] && unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
                 trace("sourcesep: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
             }
             ri->owns_temp_cache = 0;
             ri->cache_raw_path[0] = 0;
-        }
-
-        if (!finalized && !keep_raw_for_playback && open_cache_if_available(ri, ri->cache_final_path) == 0) {
-            finalized = 1;
-        }
-
-        if (!aborted && child_ok) {
-            notify_waveform_refresh_for_source(ri->source_uri);
-        }
-        if (!finalized) {
-            if (mp3_tmp_path[0] && unlink(mp3_tmp_path) != 0 && errno != ENOENT) {
-                trace("sourcesep: failed to remove mp3 temp %s errno=%d\n", mp3_tmp_path, errno);
-            }
-            trace("sourcesep: cache stop aborted=%d child_ok=%d convert_ok=%d keep_raw=%d cache=%s\n",
-                aborted, child_ok, convert_ok, keep_raw_for_playback, ri->cache_final_path);
         }
     }
     cache_enforce_limit();
@@ -2365,7 +2360,9 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
 
     if (read_bytes <= 0 && ri->stream_finished) {
         if (!ri->cache_snd && ri->cache_valid && ri->cache_final_path[0]) {
-            open_cache_if_available(ri, ri->cache_final_path);
+            if (open_cache_if_available(ri, ri->cache_final_path) == 0) {
+                trace("sourcesep: switched to final cache %s\n", ri->cache_final_path);
+            }
         }
         if (ri->cache_snd) {
             sf_count_t frame = (sf_count_t)(ri->data_bytes_read / ri->bytes_per_frame);
@@ -2458,9 +2455,10 @@ sourcesep_start(void) {
     cache_index_prune_invalid();
     cache_remove_unindexed_mp3s();
     cache_remove_stale_temp_files();
+    sourcesep_set_mode(SOURCESEP_MODE_ORIGINAL);
     try_install_gui_button();
     update_button_label();
-    apply_mode_to_all_playlists(sourcesep_get_mode());
+    apply_mode_to_all_playlists(SOURCESEP_MODE_ORIGINAL);
     schedule_precache_rescan();
     return 0;
 }
